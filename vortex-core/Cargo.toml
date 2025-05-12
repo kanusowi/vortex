@@ -1,0 +1,20 @@
+[package]
+name = "vortex-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ndarray = { workspace = true }
+rand = { workspace = true }
+log = { workspace = true } # Keep log facade dep even if using tracing directly
+thiserror = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+async-trait = { workspace = true }
+tracing.workspace = true
+parking_lot = { version = "0.12", features = ["serde"] } # For interior mutability in Node connections
+node = "0.0.1-pre.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3.10" # Or use workspace version if available and suitable

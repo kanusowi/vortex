@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "vortex-core",
+    "vortex-server",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Common deps
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1.38", features = ["full"] } # Use a recent Tokio 1.x
+ndarray = { version = "0.15", features = ["serde-1"] }
+
+# Core specific
+rand = "0.8"
+bincode = "1.3"
+async-trait = "0.1"
+
+# Server specific
+axum = "0.7"
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+hyper = { version = "1", features = ["full"] } # Explicitly add hyper v1
