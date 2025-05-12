@@ -1,352 +1,181 @@
-# Vortex: High-Performance Vector Similarity Search in Rust 🦀
+<div align="center">
 
-Vortex is a high-performance Approximate Nearest Neighbor (ANN) search library and server written entirely in Rust. It implements the HNSW (Hierarchical Navigable Small World) algorithm for fast vector similarity searches, optimized for speed and memory efficiency.
+## High-Performance Vector Similarity Search in Rust 🦀
 
-The goal of Vortex is to provide a production-ready, embeddable core library (`vortex-core`) and a minimal, functional API server (`vortex-server`) that leverages Rust's performance characteristics for demanding vector search tasks like Retrieval-Augmented Generation (RAG), semantic search, and recommendation systems.
+</div>
 
-## ✨ Key Features (Current Stage)
+## 📋 Overview
 
-*   **HNSW Algorithm:** Core implementation of the HNSW algorithm for ANN search.
-*   **Distance Metrics:** Supports common metrics:
-    *   Cosine Similarity
-    *   Euclidean (L2) Distance
-*   **Pure Rust:** Written entirely in stable Rust for performance, safety, and cross-platform compatibility.
-*   **Async API Server:** Minimal RESTful API server built with Axum and Tokio for non-blocking I/O.
-*   **Basic Persistence:** Ability to save and load index state to/from disk (`bincode` format).
-*   **Configurable:** HNSW parameters (M, ef_construction, ef_search, ml) can be configured per index.
-*   **Embeddable Core:** The `vortex-core` library can be used directly within other Rust applications.
-*   **Basic Operations:** Create indices, add/update vectors, search vectors, retrieve vectors, delete vectors (soft delete), get index stats.
+Vortex is a high-performance Approximate Nearest Neighbor (ANN) search library and server written entirely in Rust. Built on the HNSW (Hierarchical Navigable Small World) algorithm, Vortex delivers fast vector similarity searches with memory efficiency.
 
-## ⚠️ Project Status: Alpha / Foundational
+**Perfect for:**
+- Retrieval-Augmented Generation (RAG)
+- Semantic search
+- Recommendation systems
+- Any application requiring fast vector similarity comparisons
 
-Vortex is currently in an early **alpha / foundational stage**. The core HNSW logic and basic API are implemented, but it requires further testing, optimization, and feature development before being considered production-ready.
+## ✨ Key Features
 
-**Known Limitations / Areas for Improvement:**
+- **HNSW Algorithm** - Fast approximate nearest neighbor search
+- **Multiple Distance Metrics** - Cosine similarity and Euclidean (L2) distance
+- **Pure Rust Implementation** - High performance, memory safety, and cross-platform compatibility
+- **Async API Server** - Non-blocking I/O with Axum and Tokio
+- **Persistence** - Save and load index state to/from disk
+- **Configurable** - Customizable HNSW parameters
+- **Embeddable Core** - Use `vortex-core` directly in your Rust applications
 
-*   **HNSW Insertion:** The current implementation performs one-way connections (new node -> neighbors). Full bi-directional connection updates and pruning require further refinement, potentially involving interior mutability or state management redesign.
-*   **HNSW Deletion:** Deletion is currently "soft" - nodes are marked as deleted but remain in the graph structure. Search correctly skips deleted nodes, but this doesn't reclaim memory or fully remove the node from traversals initiated at other points. True deletion in HNSW is complex.
-*   **Server State Mutability:** The current server architecture uses `Arc<RwLock<HnswIndex>>` for state, which works but could be refined further, especially if supporting multiple index types via `dyn Index` becomes a priority again.
-*   **Error Handling:** Error handling is functional but could be more granular in places.
-*   **Performance:** Benchmarking and targeted performance optimizations have not yet been performed.
-*   **Configuration:** Server configuration (port, etc.) is hardcoded; index persistence paths are handled by the client.
-*   **Advanced Features:** Features like filtering during search, batch operations, memory mapping (`mmap`), payload storage/retrieval, and advanced configuration options are not yet implemented.
+## ⚠️ Project Status: Alpha
 
-## 🏛️ Architecture Overview
+Vortex is currently in **alpha stage**. Core functionality is implemented, but further testing and optimization are needed before production use.
 
-Vortex uses a Rust workspace with two main crates:
+**Current limitations:**
+- One-way connections during insertion
+- Soft deletion (nodes marked as deleted but remain in graph)
+- Server configuration is mostly hardcoded
+- Advanced features like filtering, batch operations, and memory mapping are not yet implemented
 
-1.  **`vortex-core`:** The core library containing the HNSW implementation, distance metrics, data structures, configuration, error handling, and the main `Index` trait. It has minimal dependencies and is designed to be embeddable.
-2.  **`vortex-server`:** A web server built using the Axum framework. It exposes the functionality of `vortex-core` via a RESTful JSON API. It depends on `vortex-core`.
+## 🏛️ Architecture
 
-## 🚀 Getting Started
+The project consists of two main components:
+
+- **`vortex-core`**: The core library with HNSW implementation and minimal dependencies
+- **`vortex-server`**: A RESTful API server built with Axum that exposes `vortex-core` functionality
+
+## 🚀 Quick Start
 
 ### Prerequisites
 
-*   **Rust:** Ensure you have a recent stable Rust toolchain installed. You can get it from [rustup.rs](https://rustup.rs/).
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    rustc --version
-    cargo --version
-    ```
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
 
-### Building the Project
-
-Clone the repository and build the entire workspace using Cargo:
+### Installation
 
 ```bash
+# Clone the repository
 git clone git@github.com:kanusowi/vortex.git
 cd vortex
+
+# Build in release mode
 cargo build --release
 ```
 
-This command compiles both `vortex-core` and `vortex-server` in release mode with optimizations. The executables and libraries will be located in the `target/release` directory.
-
-### Running the API Server
-
-You can run the API server directly using Cargo:
+### Running the Server
 
 ```bash
-# Run in release mode for better performance
-cargo run --release -p vortex-server
-```
-
-By default, the server will start on `127.0.0.1:3000`.
-
-**Logging:**
-
-The server uses the `tracing` library for logging. You can control the log level using the `RUST_LOG` environment variable.
-
-```bash
-# Example: Set default level to info
-export RUST_LOG=info
-cargo run --release -p vortex-server
-
-# Example: Set server to debug, core to trace
-export RUST_LOG=vortex_server=debug,vortex_core=trace
-cargo run --release -p vortex-server
-
-# Example: Run with info level directly
+# Run with default logging (info level)
 RUST_LOG=info cargo run --release -p vortex-server
 ```
 
-## 🔌 Using the API (`vortex-server`)
+The server starts on `127.0.0.1:3000` by default.
 
-You can interact with the running server using tools like `curl` or any HTTP client.
+## 🔌 API Usage
 
-**(Note:** Replace `768` with your desired vector dimensionality in the examples below.)
-
-**1. Create a New Index**
-
-*   **Endpoint:** `POST /indices`
-*   **Body (JSON):**
-    ```json
-    {
-      "name": "my_index",
-      "config": {
-        "m": 16,
-        "m_max0": 32,
-        "ef_construction": 200,
-        "ef_search": 50,
-        "ml": 0.318, // Example: Approx 1 / ln(16)
-        "seed": null    // Optional: null or integer for deterministic builds
-      },
-      "metric": "Cosine", // Or "L2"
-      "dimensions": 768
-    }
-    ```
-*   **Example (`curl`):**
-    ```bash
-    curl -X POST http://127.0.0.1:3000/indices \
-         -H "Content-Type: application/json" \
-         -d '{
-              "name": "my_index",
-              "config": {"m": 16, "m_max0": 32, "ef_construction": 200, "ef_search": 50, "ml": 0.318, "seed": null},
-              "metric": "Cosine",
-              "dimensions": 768
-            }'
-    ```
-*   **Success Response (201 Created):**
-    ```json
-    {
-      "message": "Index 'my_index' created successfully"
-    }
-    ```
-
-**2. Add or Update a Vector**
-
-*   **Endpoint:** `PUT /indices/{name}/vectors`
-*   **Path Parameter:** `name` - The name of the index.
-*   **Body (JSON):**
-    ```json
-    {
-      "id": "vector_id_1",
-      "vector": [0.1, 0.2, ..., 0.9] // Array of f32 with 'dimensions' elements
-    }
-    ```
-*   **Example (`curl`):**
-    ```bash
-    # Replace [...] with your actual 768-dim vector
-    curl -X PUT http://127.0.0.1:3000/indices/my_index/vectors \
-         -H "Content-Type: application/json" \
-         -d '{
-              "id": "vector_id_1",
-              "vector": [0.1, 0.2, ..., 0.9]
-            }'
-    ```
-*   **Success Response:**
-    *   `201 Created` if the vector was added.
-    *   `200 OK` if the vector was updated.
-    *   Body: `{"message": "Vector 'vector_id_1' processed successfully"}`
-
-**3. Search for Vectors**
-
-*   **Endpoint:** `POST /indices/{name}/search`
-*   **Path Parameter:** `name` - The name of the index.
-*   **Body (JSON):**
-    ```json
-    {
-      "query_vector": [0.11, 0.21, ..., 0.91], // Query vector (f32 array)
-      "k": 5                                  // Number of neighbors to retrieve
-    }
-    ```
-*   **Example (`curl`):**
-    ```bash
-    # Replace [...] with your query vector
-    curl -X POST http://127.0.0.1:3000/indices/my_index/search \
-         -H "Content-Type: application/json" \
-         -d '{
-              "query_vector": [0.11, 0.21, ..., 0.91],
-              "k": 5
-            }'
-    ```
-*   **Success Response (200 OK):**
-    ```json
-    {
-      "results": [
-        {"id": "vector_id_3", "score": 0.987}, // Highest similarity (Cosine) or lowest distance (L2)
-        {"id": "vector_id_1", "score": 0.954},
-        // ... up to k results
-      ]
-    }
-    ```
-
-**4. Get Index Statistics**
-
-*   **Endpoint:** `GET /indices/{name}/stats`
-*   **Path Parameter:** `name` - The name of the index.
-*   **Example (`curl`):**
-    ```bash
-    curl http://127.0.0.1:3000/indices/my_index/stats
-    ```
-*   **Success Response (200 OK):**
-    ```json
-    {
-      "vector_count": 1500,
-      "dimensions": 768,
-      "config": {
-        "m": 16,
-        "m_max0": 32,
-        "ef_construction": 200,
-        "ef_search": 50,
-        "ml": 0.318,
-        "seed": null
-      },
-      "metric": "Cosine"
-    }
-    ```
-
-**5. Get a Vector by ID**
-
-*   **Endpoint:** `GET /indices/{name}/vectors/{vector_id}`
-*   **Path Parameters:** `name`, `vector_id`.
-*   **Example (`curl`):**
-    ```bash
-    curl http://127.0.0.1:3000/indices/my_index/vectors/vector_id_1
-    ```
-*   **Success Response (200 OK):**
-    ```json
-    {
-      "id": "vector_id_1",
-      "vector": [0.1, 0.2, ..., 0.9]
-    }
-    ```
-*   **Not Found Response (404 Not Found):**
-    ```json
-    {
-      "error": "Vector ID 'vector_id_unknown' not found"
-    }
-    ```
-
-**6. Delete a Vector by ID**
-
-*   **Endpoint:** `DELETE /indices/{name}/vectors/{vector_id}`
-*   **Path Parameters:** `name`, `vector_id`.
-*   **Example (`curl`):**
-    ```bash
-    curl -X DELETE http://127.0.0.1:3000/indices/my_index/vectors/vector_id_1
-    ```
-*   **Success Response:** `204 No Content` (with an empty body).
-*   **Not Found Response:** `404 Not Found` (with JSON error body).
-
-## 📦 Using the Core Library (`vortex-core`)
-
-You can embed `vortex-core` directly into your Rust applications.
-
-1.  Add `vortex-core` to your `Cargo.toml`:
-    ```toml
-    [dependencies]
-    vortex-core = { path = "../vortex-core" } # Or use version = "0.1.0" if published
-    tokio = { version = "1", features = ["full"] } # Needed for async runtime
-    ```
-
-2.  Use the library in your code:
-
-    ```rust
-    use vortex_core::{HnswIndex, Index, HnswConfig, DistanceMetric, Embedding, VortexResult};
-    use std::path::Path;
-    use std::fs::File;
-    use std::io::{BufReader, BufWriter};
-
-    #[tokio::main]
-    async fn main() -> VortexResult<()> {
-        // 1. Create a new index configuration
-        let config = HnswConfig::new(16, 200, 50, 1.0 / (16.0f64.ln())); // M, ef_construction, ef_search, ml
-        let dimensions = 4; // Example dimension
-
-        // 2. Create a new index instance
-        let mut index = HnswIndex::new(config, DistanceMetric::L2, dimensions)?;
-
-        // 3. Add some vectors
-        let vec1: Embedding = vec![1.0, 1.0, 0.0, 0.0].into();
-        let vec2: Embedding = vec![1.1, 1.0, 0.1, 0.0].into(); // Close to vec1
-        let vec3: Embedding = vec![5.0, 5.0, 5.0, 5.0].into(); // Far away
-
-        index.add_vector("vec1".to_string(), vec1).await?;
-        index.add_vector("vec2".to_string(), vec2).await?;
-        index.add_vector("vec3".to_string(), vec3).await?;
-
-        println!("Index size: {}", index.len());
-
-        // 4. Search for nearest neighbors
-        let query: Embedding = vec![1.05, 1.05, 0.05, 0.0].into(); // Query near vec1/vec2
-        let k = 2;
-        let results = index.search(query, k).await?;
-
-        println!("Search Results (k={}):", k);
-        for (id, score) in results {
-            println!("  ID: {}, Score (Distance): {:.4}", id, score);
-        }
-        // Expected: vec1 and vec2 should be the top results with low distance scores.
-
-        // 5. Get a specific vector
-        if let Some(v) = index.get_vector(&"vec1".to_string()).await? {
-            println!("Retrieved vec1: {:?}", v.0.as_slice().unwrap_or_default());
-        }
-
-        // 6. Save the index
-        let save_path = Path::new("my_hnsw_index.bin");
-        { // Scope for writer
-             let file = File::create(save_path)
-                .map_err(|e| vortex_core::VortexError::IoError { path: save_path.to_path_buf(), source: e })?;
-             let mut writer = BufWriter::new(file);
-             index.save(&mut writer).await?;
-             println!("Index saved to {:?}", save_path);
-        } // Writer flushed and file closed here
-
-
-        // 7. Load the index
-        let loaded_index = HnswIndex::load_from_path(save_path, dimensions)?;
-        println!("Index loaded successfully. Size: {}", loaded_index.len());
-
-        // Verify search on loaded index
-        let query_loaded: Embedding = vec![5.1, 5.0, 4.9, 5.0].into(); // Query near vec3
-        let results_loaded = loaded_index.search(query_loaded, 1).await?;
-        println!("Search Results (Loaded Index, k=1):");
-         for (id, score) in results_loaded {
-            println!("  ID: {}, Score (Distance): {:.4}", id, score);
-            assert_eq!(id, "vec3"); // Should find vec3
-        }
-
-        Ok(())
-    }
-    ```
-
-## ✅ Running Tests
-
-To run the unit and integration tests for both crates:
+### Create an Index
 
 ```bash
-cargo test --all
+curl -X POST http://127.0.0.1:3000/indices \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my_index",
+    "config": {
+      "m": 16,
+      "m_max0": 32,
+      "ef_construction": 200,
+      "ef_search": 50,
+      "ml": 0.318
+    },
+    "metric": "Cosine",
+    "dimensions": 768
+  }'
 ```
 
-This command will execute all tests defined within `vortex-core` and `vortex-server`.
+### Add a Vector
+
+```bash
+curl -X PUT http://127.0.0.1:3000/indices/my_index/vectors \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "vector_id_1",
+    "vector": [0.1, 0.2, ..., 0.9]
+  }'
+```
+
+### Search for Similar Vectors
+
+```bash
+curl -X POST http://127.0.0.1:3000/indices/my_index/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query_vector": [0.11, 0.21, ..., 0.91],
+    "k": 5
+  }'
+```
+
+### More Endpoints
+
+- **Get Index Stats**: `GET /indices/{name}/stats`
+- **Get Vector**: `GET /indices/{name}/vectors/{vector_id}`
+- **Delete Vector**: `DELETE /indices/{name}/vectors/{vector_id}`
+
+## 📦 Library Usage
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+vortex-core = { path = "../vortex-core" }
+tokio = { version = "1", features = ["full"] }
+```
+
+Example code:
+
+```rust
+use vortex_core::{HnswIndex, Index, HnswConfig, DistanceMetric, Embedding, VortexResult};
+
+#[tokio::main]
+async fn main() -> VortexResult<()> {
+    // Create a new index configuration
+    let config = HnswConfig::new(16, 200, 50, 1.0 / (16.0f64.ln()));
+    let dimensions = 4;
+
+    // Create index instance
+    let mut index = HnswIndex::new(config, DistanceMetric::L2, dimensions)?;
+
+    // Add vectors
+    let vec1: Embedding = vec![1.0, 1.0, 0.0, 0.0].into();
+    index.add_vector("vec1".to_string(), vec1).await?;
+
+    // Search
+    let query: Embedding = vec![1.05, 1.05, 0.05, 0.0].into();
+    let results = index.search(query, 2).await?;
+
+    Ok(())
+}
+```
 
 ## ⚙️ Configuration
 
-*   **Server Logging:** Controlled via the `RUST_LOG` environment variable (see [Running the API Server](#running-the-api-server)).
-*   **HNSW Parameters:** Configured per-index via the `POST /indices` API endpoint (`m`, `ef_construction`, `ef_search`, `ml`, `seed`).
-*   **Persistence:** Index saving/loading is currently triggered manually via API calls or direct library usage. File paths need to be managed by the client application or future server configuration.
+Control logging with the `RUST_LOG` environment variable:
+
+```bash
+# Set server to debug, core to trace
+RUST_LOG=vortex_server=debug,vortex_core=trace cargo run --release -p vortex-server
+```
+
+## ✅ Testing
+
+```bash
+# Run all tests
+cargo test --all
+```
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to open an issue to discuss bugs or feature requests, or submit a pull request.
+Contributions are welcome! Please feel free to:
+
+- Open issues for bugs or feature requests
+- Submit pull requests
+- Improve documentation
+- Share your experience using Vortex

@@ -18,3 +18,5 @@ node = "0.0.1-pre.1"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3.10" # Or use workspace version if available and suitable
+rstest = "0.21" # For parameterized tests
+proptest = "1.5" # For property-based testing

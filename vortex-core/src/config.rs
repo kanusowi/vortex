@@ -67,3 +67,74 @@ impl Default for HnswConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> HnswConfig {
+        HnswConfig::default()
+    }
+
+    #[test]
+    fn test_hnsw_config_validate_valid() {
+        assert!(valid_config().validate().is_ok());
+    }
+
+    #[test]
+    fn test_hnsw_config_validate_invalid_m() {
+        let mut config = valid_config();
+        config.m = 0;
+        assert!(matches!(config.validate(), Err(VortexError::Configuration(_))));
+    }
+
+    #[test]
+    fn test_hnsw_config_validate_invalid_m_max0() {
+        let mut config = valid_config();
+        config.m_max0 = 0;
+        assert!(matches!(config.validate(), Err(VortexError::Configuration(_))));
+    }
+
+    #[test]
+    fn test_hnsw_config_validate_invalid_ef_construction() {
+        let mut config = valid_config();
+        config.ef_construction = 0;
+        assert!(matches!(config.validate(), Err(VortexError::Configuration(_))));
+    }
+
+    #[test]
+    fn test_hnsw_config_validate_invalid_ef_search() {
+        let mut config = valid_config();
+        config.ef_search = 0;
+        assert!(matches!(config.validate(), Err(VortexError::Configuration(_))));
+    }
+
+    #[test]
+    fn test_hnsw_config_validate_invalid_ml_zero() {
+        let mut config = valid_config();
+        config.ml = 0.0;
+        assert!(matches!(config.validate(), Err(VortexError::Configuration(_))));
+    }
+
+    #[test]
+    fn test_hnsw_config_validate_invalid_ml_negative() {
+        let mut config = valid_config();
+        config.ml = -0.1;
+        assert!(matches!(config.validate(), Err(VortexError::Configuration(_))));
+    }
+
+    #[test]
+    fn test_hnsw_config_new() {
+        let m = 10;
+        let ef_c = 100;
+        let ef_s = 20;
+        let ml = 0.5;
+        let config = HnswConfig::new(m, ef_c, ef_s, ml);
+        assert_eq!(config.m, m);
+        assert_eq!(config.m_max0, m * 2);
+        assert_eq!(config.ef_construction, ef_c);
+        assert_eq!(config.ef_search, ef_s);
+        assert_eq!(config.ml, ml);
+        assert_eq!(config.seed, None);
+    }
+}

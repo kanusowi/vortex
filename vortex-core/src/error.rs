@@ -54,3 +54,98 @@ impl From<bincode::Error> for VortexError {
         VortexError::Serialization(format!("Bincode error: {}", err))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn test_error_display_configuration() {
+        let err = VortexError::Configuration("Test config error".to_string());
+        assert_eq!(format!("{}", err), "Configuration error: Test config error");
+    }
+
+    #[test]
+    fn test_error_display_dimension_mismatch() {
+        let err = VortexError::DimensionMismatch { expected: 10, actual: 5 };
+        assert_eq!(format!("{}", err), "Vector dimension mismatch: expected 10, got 5");
+    }
+
+    #[test]
+    fn test_error_display_not_found() {
+        let err = VortexError::NotFound("vec123".to_string());
+        assert_eq!(format!("{}", err), "Vector ID not found: vec123");
+    }
+
+    #[test]
+    fn test_error_display_already_exists() {
+        let err = VortexError::AlreadyExists("vec456".to_string());
+        assert_eq!(format!("{}", err), "Vector ID already exists: vec456");
+    }
+
+    #[test]
+    fn test_error_display_empty_index() {
+        let err = VortexError::EmptyIndex;
+        assert_eq!(format!("{}", err), "Index is empty, cannot perform search");
+    }
+
+    #[test]
+    fn test_error_display_io_error() {
+        let path = PathBuf::from("/tmp/testfile");
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
+        let err = VortexError::IoError { path: path.clone(), source: io_err };
+        // The exact format of the source io::Error might vary slightly by OS/platform,
+        // so we check for the main parts.
+        assert!(format!("{}", err).contains("I/O error accessing path \"/tmp/testfile\""));
+        assert!(format!("{}", err).contains("file not found"));
+    }
+
+    #[test]
+    fn test_error_display_serialization() {
+        let err = VortexError::Serialization("Test serialization error".to_string());
+        assert_eq!(format!("{}", err), "Serialization error: Test serialization error");
+    }
+
+    #[test]
+    fn test_error_display_deserialization() {
+        let err = VortexError::Deserialization("Test deserialization error".to_string());
+        assert_eq!(format!("{}", err), "Deserialization error: Test deserialization error");
+    }
+
+    #[test]
+    fn test_error_display_unsupported_operation() {
+        let err = VortexError::UnsupportedOperation("Test unsupported op".to_string());
+        assert_eq!(format!("{}", err), "Operation is not supported: Test unsupported op");
+    }
+
+    #[test]
+    fn test_error_display_internal() {
+        let err = VortexError::Internal("Test internal error".to_string());
+        assert_eq!(format!("{}", err), "Internal error: Test internal error");
+    }
+
+    #[test]
+    fn test_error_display_invalid_distance_metric() {
+        let err = VortexError::InvalidDistanceMetric;
+        assert_eq!(format!("{}", err), "Invalid distance metric specified");
+    }
+
+    #[test]
+    fn test_from_bincode_error() {
+        // Create a dummy bincode::Error (this is a bit tricky as ErrorKind is non-exhaustive)
+        // We'll simulate one by using a Deserialization error which bincode can produce.
+        let bincode_err_kind = bincode::ErrorKind::DeserializeAnyNotSupported;
+        let bincode_err = Box::new(bincode_err_kind);
+        
+        let vortex_err: VortexError = bincode_err.into();
+        match vortex_err {
+            VortexError::Serialization(msg) => {
+                assert!(msg.contains("Bincode error"));
+                // Making the check more general as the exact message for DeserializeAnyNotSupported might vary.
+                // We've already confirmed it's a Bincode error.
+            }
+            _ => panic!("Expected VortexError::Serialization variant"),
+        }
+    }
+}
