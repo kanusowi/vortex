@@ -31,6 +31,11 @@ pub trait Index: Send + Sync + std::fmt::Debug {
     fn dimensions(&self) -> usize;
     fn config(&self) -> HnswConfig;
     fn distance_metric(&self) -> DistanceMetric;
+    
+    /// Lists vectors in the index, optionally limiting the count.
+    /// Returns a vector of (ID, Embedding) tuples.
+    /// Note: The order is not guaranteed.
+    async fn list_vectors(&self, limit: Option<usize>) -> VortexResult<Vec<(VectorId, Embedding)>>;
 }
 
 /// Data structure representing the HNSW index state for serialization.
@@ -440,6 +445,25 @@ impl Index for HnswIndex {
 
     fn distance_metric(&self) -> DistanceMetric {
         self.metric
+    }
+
+    async fn list_vectors(&self, limit: Option<usize>) -> VortexResult<Vec<(VectorId, Embedding)>> {
+        debug!(limit = ?limit, total_nodes = self.nodes.len(), deleted_count = self.deleted_count, "Listing vectors");
+        
+        let mut results = Vec::new();
+        let effective_limit = limit.unwrap_or(usize::MAX); // Use MAX if no limit
+
+        for node in self.nodes.iter() {
+            if results.len() >= effective_limit {
+                break; // Stop if limit is reached
+            }
+            if !node.deleted {
+                results.push((node.id.clone(), node.vector.clone()));
+            }
+        }
+        
+        debug!(listed_count = results.len(), "Finished listing vectors");
+        Ok(results)
     }
 }
 

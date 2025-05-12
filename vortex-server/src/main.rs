@@ -32,8 +32,13 @@ async fn main() {
 
     // Define API routes
     let app = Router::new()
+        // Routes for /indices
+        .route("/indices", get(handlers::list_indices)) // Added GET for listing indices
         .route("/indices", post(handlers::create_index))
-        .route("/indices/:name/vectors", put(handlers::add_vector))
+        // Routes for /indices/:name/vectors
+        .route("/indices/:name/vectors", get(handlers::list_vectors)) // Existing GET for listing vectors
+        // Route for adding/updating a single vector (PUT) - Keep this distinct
+        .route("/indices/:name/vectors", put(handlers::add_vector)) 
         .route("/indices/:name/search", post(handlers::search_vectors))
         .route("/indices/:name/stats", get(handlers::get_index_stats))
         .route(

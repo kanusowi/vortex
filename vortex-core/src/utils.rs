@@ -10,7 +10,7 @@ pub(crate) fn generate_random_level(ml: f64, rng: &mut impl Rng) -> usize {
 }
 
 /// Creates a seeded random number generator or a default one.
-pub(crate) fn create_rng(seed: Option<u64>) -> StdRng {
+pub fn create_rng(seed: Option<u64>) -> StdRng { // Changed to pub
     match seed {
         Some(s) => StdRng::seed_from_u64(s),
         None => StdRng::from_entropy(),

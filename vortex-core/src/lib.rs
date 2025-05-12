@@ -4,7 +4,7 @@ pub mod error;
 pub mod hnsw;
 pub mod index;
 pub mod vector;
-mod utils; // Keep utils internal for now
+pub mod utils; // Make utils public for benchmarks/tests
 
 // Re-export key types/traits for easier use
 pub use config::HnswConfig;

@@ -3,18 +3,33 @@ use crate::models::{
     AddVectorRequest, CreateIndexRequest, SearchRequest, SearchResponse, SearchResultItem,
     StatsResponse, SuccessResponse, VectorResponse,
 };
-use crate::state::AppState; // Use AppState directly
+use crate::state::AppState;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State}, // Added Query
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
+use serde::Deserialize; // Added Deserialize
+// use std::collections::HashMap; // Added HashMap (for query params)
 use std::sync::Arc;
-use tokio::sync::RwLock; // Import RwLock for locking index
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-use vortex_core::{Embedding, HnswIndex, Index, VectorId, VortexError}; // Import Index trait for methods
+use vortex_core::{Embedding, HnswIndex, Index, VectorId, VortexError};
+
+
+/// Handler for `GET /indices`
+/// Lists the names of all available indices.
+pub async fn list_indices(
+    State(state): State<AppState>,
+) -> ServerResult<Json<Vec<String>>> {
+    debug!("Received request to list indices");
+    let indices_map = state.indices.read().await; // Read lock on the map
+    let index_names: Vec<String> = indices_map.keys().cloned().collect();
+    debug!(count = index_names.len(), "Returning index list");
+    Ok(Json(index_names))
+}
 
 /// Handler for `POST /indices`
 /// Creates a new vector index.
@@ -208,6 +223,49 @@ pub async fn get_vector(
             Err(ServerError::CoreError(VortexError::NotFound(vector_id))) // Return 404 via core error
         }
     }
+}
+
+
+/// Query parameters for listing vectors
+#[derive(Deserialize, Debug)]
+pub struct ListVectorsParams {
+    limit: Option<usize>,
+}
+
+/// Handler for `GET /indices/{name}/vectors`
+/// Lists vectors in the specified index, with an optional limit.
+pub async fn list_vectors(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+    Query(params): Query<ListVectorsParams>,
+) -> ServerResult<Json<Vec<VectorResponse>>> { // Return a Vec of VectorResponse
+    debug!(index_name = %index_name, limit = ?params.limit, "Received request to list vectors");
+
+    let index_lock_arc: Arc<RwLock<HnswIndex>> = { // Scope for HashMap read lock
+        let indices_map = state.indices.read().await;
+        indices_map
+            .get(&index_name)
+            .cloned()
+            .ok_or_else(|| ServerError::IndexNotFound(index_name.clone()))?
+    };
+
+    // Acquire read lock on the specific index's RwLock
+    let index_guard = index_lock_arc.read().await;
+
+    // Call the core library method
+    let vectors_list = index_guard.list_vectors(params.limit).await?;
+    debug!(index_name=%index_name, count=vectors_list.len(), "Listed vectors from core");
+
+    // Convert core results to API response model
+    let response_list = vectors_list
+        .into_iter()
+        .map(|(id, embedding)| VectorResponse {
+            id,
+            vector: embedding.into(), // Convert Embedding to Vec<f32>
+        })
+        .collect();
+
+    Ok(Json(response_list))
 }
 
 /// Handler for `DELETE /indices/{name}/vectors/{vector_id}`

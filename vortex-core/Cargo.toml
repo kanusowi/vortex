@@ -16,7 +16,10 @@ parking_lot = { version = "0.12", features = ["serde"] } # For interior mutabili
 node = "0.0.1-pre.1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] } # Needed for async benchmarks
 tempfile = "3.10" # Or use workspace version if available and suitable
-rstest = "0.21" # For parameterized tests
-proptest = "1.5" # For property-based testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "hnsw_benchmarks"
+harness = false
