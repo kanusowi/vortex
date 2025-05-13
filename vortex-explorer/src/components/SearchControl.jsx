@@ -16,6 +16,7 @@ function SearchControl() {
         defaultValues: {
             queryVectorString: '',
             k: 10,
+            filterString: '', // Added for metadata filter
         },
     });
 
@@ -57,13 +58,26 @@ function SearchControl() {
              return;
         }
 
-        console.log(`Dispatching search for index: ${selectedIndex}, k: ${kValue}, vector:`, queryVector);
-        dispatch(searchVectors({ indexName: selectedIndex, queryVector, k: kValue }));
+        let filterObject;
+        if (data.filterString && data.filterString.trim() !== '') {
+            try {
+                filterObject = JSON.parse(data.filterString);
+                if (typeof filterObject !== 'object' || filterObject === null || Array.isArray(filterObject)) {
+                    throw new Error('Filter must be a JSON object.');
+                }
+            } catch (e) {
+                setError('filterString', { type: 'manual', message: e.message || 'Invalid JSON object for filter.' });
+                return;
+            }
+        }
+
+        console.log(`Dispatching search for index: ${selectedIndex}, k: ${kValue}, vector:`, queryVector, "filter:", filterObject);
+        dispatch(searchVectors({ indexName: selectedIndex, queryVector, k: kValue, filter: filterObject }));
     };
 
     // Reset form if index changes
     React.useEffect(() => {
-        reset({ queryVectorString: '', k: 10 }); 
+        reset({ queryVectorString: '', k: 10, filterString: '' }); 
     }, [selectedIndex, reset]);
 
     return (
@@ -113,6 +127,26 @@ function SearchControl() {
                         helperText={errors.k?.message}
                         disabled={!selectedIndex || searchStatus === 'searching'}
                         InputProps={{ inputProps: { min: 1 } }} 
+                    />
+                )}
+            />
+
+            <Controller
+                name="filterString"
+                control={control}
+                render={({ field }) => (
+                    <TextField
+                        {...field}
+                        label="Metadata Filter (JSON, optional)"
+                        variant="outlined"
+                        size="small"
+                        multiline
+                        rows={2}
+                        fullWidth
+                        error={!!errors.filterString}
+                        helperText={errors.filterString?.message}
+                        disabled={!selectedIndex || searchStatus === 'searching'}
+                        placeholder='e.g., {"category": "books", "year": 2023}'
                     />
                 )}
             />

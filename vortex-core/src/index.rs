@@ -36,6 +36,9 @@ pub trait Index: Send + Sync + std::fmt::Debug {
     /// Returns a vector of (ID, Embedding) tuples.
     /// Note: The order is not guaranteed.
     async fn list_vectors(&self, limit: Option<usize>) -> VortexResult<Vec<(VectorId, Embedding)>>;
+
+    /// Searches for the k nearest neighbors using a specified ef_search value.
+    async fn search_with_ef(&self, query: Embedding, k: usize, ef_search: usize) -> VortexResult<Vec<(VectorId, f32)>>;
 }
 
 /// Data structure representing the HNSW index state for serialization.
@@ -126,24 +129,26 @@ impl HnswIndex {
         })
     }
 
-    pub fn load(reader: &mut dyn Read, expected_dimensions: usize) -> VortexResult<Self> {
+    /// Loads an HNSW index from a reader.
+    /// The dimensions of the index are determined from the loaded data.
+    pub fn load(reader: &mut dyn Read) -> VortexResult<Self> {
         info!("Loading HNSW index from reader");
         let index: HnswIndex = bincode::deserialize_from(reader)
             .map_err(|e| VortexError::Deserialization(format!("Failed to deserialize index: {}", e)))?;
-
-        if index.dimensions != expected_dimensions {
-            warn!(loaded_dims=index.dimensions, expected_dims=expected_dimensions, "Loaded index dimension mismatch");
-            return Err(VortexError::DimensionMismatch { expected: expected_dimensions, actual: index.dimensions });
-        }
-        info!(vector_count=index.len(), "Index loaded successfully");
+        
+        // Dimension validation can be done by the caller if they have an expectation,
+        // or simply trust the loaded dimensions. For server startup, we'll trust.
+        info!(dimensions=index.dimensions, vector_count=index.len(), "Index loaded successfully");
         Ok(index)
     }
 
-    pub fn load_from_path(path: &Path, expected_dimensions: usize) -> VortexResult<Self> {
+    /// Loads an HNSW index from a file path.
+    /// The dimensions of the index are determined from the loaded data.
+    pub fn load_from_path(path: &Path) -> VortexResult<Self> {
         info!(path=?path, "Loading HNSW index from path");
          let file = File::open(path).map_err(|e| VortexError::IoError { path: path.to_path_buf(), source: e })?;
          let mut reader = BufReader::new(file);
-         Self::load(&mut reader, expected_dimensions)
+         Self::load(&mut reader)
     }
 
     fn get_node(&self, index: usize) -> Option<&ArcNode> {
@@ -380,7 +385,23 @@ impl Index for HnswIndex {
             return Ok(Vec::new());
         }
         let ef_search = std::cmp::max(k, self.config.ef_search);
-        debug!(k, ef_search, "Performing search");
+        debug!(k, ef_search, "Performing search using config.ef_search");
+        self.search_internal(query.view(), k, ef_search)
+    }
+
+    async fn search_with_ef(&self, query: Embedding, k: usize, ef_search_override: usize) -> VortexResult<Vec<(VectorId, f32)>> {
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+        if query.len() != self.dimensions {
+            return Err(VortexError::DimensionMismatch { expected: self.dimensions, actual: query.len() });
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        // Ensure ef_search_override is at least k
+        let ef_search = std::cmp::max(k, ef_search_override);
+        debug!(k, ef_search_override = ef_search, "Performing search with overridden ef_search");
         self.search_internal(query.view(), k, ef_search)
     }
 
@@ -698,8 +719,8 @@ mod tests {
         index.save(&mut writer).await.unwrap();
         drop(writer); 
 
-        let loaded_index = HnswIndex::load_from_path(&path, 3).unwrap();
-        assert_eq!(loaded_index.dimensions(), 3);
+        let loaded_index = HnswIndex::load_from_path(&path).unwrap();
+        assert_eq!(loaded_index.dimensions(), 3); // Dimensions are inherent in the loaded index
         assert_eq!(loaded_index.len(), 2);
         assert_eq!(loaded_index.config(), config);
         assert_eq!(loaded_index.distance_metric(), DistanceMetric::Cosine);
@@ -722,8 +743,8 @@ mod tests {
         assert!(!buffer.is_empty());
 
         let mut reader = Cursor::new(buffer); 
-        let loaded_index = HnswIndex::load(&mut reader, 3).unwrap(); 
-        assert_eq!(loaded_index.dimensions(), 3);
+        let loaded_index = HnswIndex::load(&mut reader).unwrap(); 
+        assert_eq!(loaded_index.dimensions(), 3); // Dimensions are inherent
         assert_eq!(loaded_index.len(), 2);
 
         let query: Embedding = vec![0.1, 0.9, 0.0].into();
@@ -734,16 +755,22 @@ mod tests {
 
      #[tokio::test]
     async fn test_load_dimension_mismatch() {
+        // This test is no longer relevant as load doesn't take expected_dimensions.
+        // The server or caller would be responsible for any dimension validation if needed post-load.
+        // For example, if loading into an existing system that expects a certain dimension.
+        // However, for simple load, the loaded dimension is the source of truth.
+        
+        // We can test that the loaded dimension is correct.
         let config = create_test_config();
-        let mut index = HnswIndex::new(config, DistanceMetric::L2, 3).unwrap();
-        index.add_vector("vecA".to_string(), vec![1.0, 0.0, 0.0].into()).await.unwrap();
+        let mut index_orig = HnswIndex::new(config, DistanceMetric::L2, 3).unwrap();
+        index_orig.add_vector("vecA".to_string(), vec![1.0, 0.0, 0.0].into()).await.unwrap();
 
         let mut buffer: Vec<u8> = Vec::new();
-        index.save(&mut buffer).await.unwrap();
+        index_orig.save(&mut buffer).await.unwrap();
 
         let mut reader = Cursor::new(buffer);
-        let result = HnswIndex::load(&mut reader, 2); 
-        assert!(matches!(result, Err(VortexError::DimensionMismatch { expected: 2, actual: 3 })));
+        let loaded_index = HnswIndex::load(&mut reader).unwrap(); 
+        assert_eq!(loaded_index.dimensions(), 3); // Check if loaded dimension is correct
     }
 
     fn get_node_connections(node: &ArcNode, level: usize) -> Vec<usize> {

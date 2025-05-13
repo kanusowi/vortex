@@ -25,7 +25,7 @@ export const fetchIndices = async () => {
  * 
  * @param {string} indexName - The name of the index.
  * @param {number} [limit=1000] - Optional limit for the number of vectors to fetch.
- * @returns {Promise<Array<{id: string, vector: number[]}>>} A promise resolving to vector data.
+ * @returns {Promise<Array<{id: string, vector: number[], metadata?: object}>>} A promise resolving to vector data, including optional metadata.
  * @throws {Error} If the network response is not ok.
  */
 export const fetchVectorsSample = async (indexName, limit = 1000) => {
@@ -103,21 +103,27 @@ export const fetchIndexStats = async (indexName) => {
  * @param {string} indexName - The name of the index.
  * @param {string} vectorId - The ID of the vector.
  * @param {number[]} vectorData - The vector data array.
+ * @param {object} [metadata] - Optional JSON metadata to associate with the vector.
  * @returns {Promise<object>} A promise resolving to the success response from the server.
  * @throws {Error} If the network response is not ok or request fails.
  */
-export const addVector = async (indexName, vectorId, vectorData) => {
+export const addVector = async (indexName, vectorId, vectorData, metadata) => {
+    const payload = { 
+        id: vectorId, 
+        vector: vectorData 
+    };
+    if (metadata !== undefined) {
+        payload.metadata = metadata;
+    }
+
     const response = await fetch(`${API_BASE_URL}/indices/${indexName}/vectors`, { // Uses PUT
         method: 'PUT',
         headers: { 
             'Content-Type': 'application/json',
             'Accept': 'application/json', 
         },
-        // Backend expects: { id: string, vector: number[] }
-        body: JSON.stringify({ 
-            id: vectorId, 
-            vector: vectorData 
-        })
+        // Backend expects: { id: string, vector: number[], metadata?: object }
+        body: JSON.stringify(payload)
     });
 
     if (!response.ok) {
@@ -138,17 +144,26 @@ export const addVector = async (indexName, vectorId, vectorData) => {
  * @param {string} indexName - The name of the index to search within.
  * @param {number[]} queryVector - The vector to search for.
  * @param {number} [k=10] - The number of nearest neighbors to return.
- * @returns {Promise<Array<{id: string, score: number}>>} A promise resolving to search results.
+ * @param {object} [filter] - Optional metadata filter object.
+ * @returns {Promise<Array<{id: string, score: number, metadata?: object}>>} A promise resolving to search results, including optional metadata.
  * @throws {Error} If the network response is not ok.
  */
-export const searchVectors = async (indexName, queryVector, k = 10) => {
+export const searchVectors = async (indexName, queryVector, k = 10, filter) => {
+    const payload = { 
+        query_vector: queryVector, 
+        k: k 
+    };
+    if (filter !== undefined) {
+        payload.filter = filter;
+    }
+
     const response = await fetch(`${API_BASE_URL}/indices/${indexName}/search`, {
         method: 'POST',
         headers: { 
             'Content-Type': 'application/json',
             'Accept': 'application/json', // Explicitly accept JSON
         },
-        body: JSON.stringify({ query_vector: queryVector, k: k }) // Corrected field name
+        body: JSON.stringify(payload)
     });
     if (!response.ok) {
         const errorText = await response.text();
@@ -156,4 +171,33 @@ export const searchVectors = async (indexName, queryVector, k = 10) => {
     }
     // Assuming API returns an array like [{ id: "vec5", score: 0.98 }, { id: "vec12", score: 0.95 }, ...]
     return response.json(); 
+};
+
+/**
+ * Adds multiple vectors to the specified index in a batch.
+ * @param {string} indexName - The name of the index.
+ * @param {Array<object>} vectors - An array of vector items, where each item is { id: string, vector: number[], metadata?: object }.
+ * @returns {Promise<object>} A promise resolving to the batch operation response from the server (e.g., { success_count, failure_count, message }).
+ * @throws {Error} If the network response is not ok or request fails.
+ */
+export const batchAddVectors = async (indexName, vectors) => {
+    const response = await fetch(`${API_BASE_URL}/indices/${indexName}/vectors/batch`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        },
+        body: JSON.stringify({ vectors: vectors }) // Backend expects { vectors: [...] }
+    });
+
+    if (!response.ok) {
+        let errorData;
+        try {
+            errorData = await response.json();
+        } catch (e) { /* Ignore */ }
+        const errorText = errorData?.message || response.statusText || 'Failed to batch add vectors';
+        throw new Error(`Batch add vectors failed for ${indexName}: ${response.status} ${errorText}`);
+    }
+
+    return response.json(); // Contains BatchOperationResponse
 };

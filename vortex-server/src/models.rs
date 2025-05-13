@@ -20,6 +20,7 @@ pub struct CreateIndexRequest {
 pub struct AddVectorRequest {
     pub id: VectorId,
     pub vector: Vec<f32>, // Accept standard Vec<f32> for JSON ease
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Request body for searching vectors.
@@ -27,7 +28,23 @@ pub struct AddVectorRequest {
 pub struct SearchRequest {
     pub query_vector: Vec<f32>, // Accept standard Vec<f32>
     pub k: usize,
+    pub filter: Option<serde_json::Value>, // Optional filter based on metadata
 }
+
+/// Item for batch vector addition.
+#[derive(Deserialize, Debug)]
+pub struct AddVectorRequestItem {
+    pub id: VectorId,
+    pub vector: Vec<f32>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Request body for batch adding vectors.
+#[derive(Deserialize, Debug)]
+pub struct BatchAddVectorRequest {
+    pub vectors: Vec<AddVectorRequestItem>,
+}
+
 
 // --- Response Bodies ---
 
@@ -36,6 +53,7 @@ pub struct SearchRequest {
 pub struct SearchResultItem {
     pub id: VectorId,
     pub score: f32, // Distance or similarity score
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Response body for search results.
@@ -49,6 +67,7 @@ pub struct SearchResponse {
 pub struct VectorResponse {
     pub id: VectorId,
     pub vector: Vec<f32>, // Return standard Vec<f32>
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Response body for index statistics.
@@ -67,4 +86,14 @@ pub struct StatsResponse {
 #[derive(Serialize)]
 pub struct SuccessResponse {
     pub message: String,
+}
+
+/// Response body for batch operations.
+#[derive(Serialize, Debug)]
+pub struct BatchOperationResponse {
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub message: String,
+    // Optional: Consider adding a field for detailed errors per item if needed.
+    // pub errors: Vec<String>, 
 }

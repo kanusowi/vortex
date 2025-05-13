@@ -47,10 +47,14 @@ function IndexSelector() {
     }, [indicesStatus, dispatch]);
 
     useEffect(() => {
-        if (selectedIndex) {
+        // Fetch stats if an index is selected AND
+        // the stats status is 'idle' (typically after a new selection or reset)
+        // OR if the last attempt to fetch stats failed.
+        // And critically, not if it's already loading.
+        if (selectedIndex && (statsStatus === 'idle' || statsStatus === 'failed') && statsStatus !== 'loading') {
             dispatch(fetchIndexStats(selectedIndex));
         }
-    }, [selectedIndex, dispatch]);
+    }, [selectedIndex, statsStatus, dispatch]); // Added statsStatus to dependency array
 
     const handleSelectionChange = (event) => {
         const newSelection = event.target.value;

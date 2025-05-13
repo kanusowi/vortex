@@ -8,10 +8,16 @@ import {
     selectVectorDataError, 
     selectDataForIndex,
     selectUmapStatus,      
-    selectUmapError
+    selectUmapError,
+    selectSearchResults, // Added
+    selectSearchStatus   // Added
 } from '../features/vectors/vectorsSlice';
 import DimensionalityReducer from './DimensionalityReducer';
 import Plotter from './Plotter';
+import { List, ListItem, ListItemText, Collapse, IconButton, Tooltip } from '@mui/material'; // Added for search results
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'; // Added
+import ExpandLessIcon from '@mui/icons-material/ExpandLess'; // Added
+import { styled } from '@mui/material/styles'; // Added for styling expand icon
 
 // Configuration for fetching vectors (e.g., sample size)
 const VECTOR_FETCH_LIMIT = 1000; // Fetch up to 1000 vectors for visualization
@@ -25,6 +31,15 @@ function VisualizationWorkspace() {
     const umapStatus = useSelector(selectUmapStatus(selectedIndex)); 
     const umapError = useSelector(selectUmapError(selectedIndex));   
     const indexData = useSelector(selectDataForIndex(selectedIndex)); 
+    const searchResults = useSelector(selectSearchResults(selectedIndex)); // Added
+    const searchStatus = useSelector(selectSearchStatus(selectedIndex));   // Added
+
+    // State for expanding/collapsing search results metadata
+    const [expandedResult, setExpandedResult] = React.useState(null);
+
+    const handleExpandResult = (resultId) => {
+        setExpandedResult(expandedResult === resultId ? null : resultId);
+    };
 
     useEffect(() => {
         // Fetch vectors only if:
@@ -126,6 +141,53 @@ function VisualizationWorkspace() {
                     </Typography>
                 )}
             </Paper>
+
+            {/* Search Results Section */}
+            {searchStatus === 'succeeded' && searchResults && searchResults.length > 0 && (
+                <Paper variant="outlined" sx={{ mt: 2, p: 2 }}>
+                    <Typography variant="h6" gutterBottom component="h3">
+                        Search Results ({searchResults.length})
+                    </Typography>
+                    <List dense sx={{ maxHeight: 300, overflow: 'auto' }}>
+                        {searchResults.map((item) => (
+                            <React.Fragment key={item.id}>
+                                <ListItem 
+                                    disablePadding 
+                                    secondaryAction={
+                                        item.metadata && (
+                                            <Tooltip title={expandedResult === item.id ? "Collapse metadata" : "Expand metadata"}>
+                                                <IconButton edge="end" aria-label="expand" onClick={() => handleExpandResult(item.id)}>
+                                                    {expandedResult === item.id ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                                                </IconButton>
+                                            </Tooltip>
+                                        )
+                                    }
+                                >
+                                    <ListItemText 
+                                        primary={`ID: ${item.id}`} 
+                                        secondary={`Score: ${item.score.toFixed(4)}`} 
+                                    />
+                                </ListItem>
+                                {item.metadata && (
+                                    <Collapse in={expandedResult === item.id} timeout="auto" unmountOnExit>
+                                        <Box sx={{ pl: 2, pb:1, pt:0.5, backgroundColor: 'action.hover', borderRadius: 1 }}>
+                                            <Typography variant="caption" component="pre" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', display: 'block' }}>
+                                                {JSON.stringify(item.metadata, null, 2)}
+                                            </Typography>
+                                        </Box>
+                                    </Collapse>
+                                )}
+                            </React.Fragment>
+                        ))}
+                    </List>
+                </Paper>
+            )}
+             {searchStatus === 'searching' && (
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 2 }}>
+                    <CircularProgress size={16} />
+                    <Typography variant="body2" color="text.secondary">Searching...</Typography>
+                </Box>
+            )}
         </Box>
     );
 }
