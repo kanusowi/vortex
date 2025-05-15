@@ -5,18 +5,24 @@ use axum::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::env;
+use std::sync::Arc; // Added Arc
+use tokio::sync::RwLock; // Added RwLock
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod config; // Basic config for now
-mod error;
-mod handlers;
-mod models;
-mod state;
-mod persistence; // Added persistence module
+pub mod config; 
+pub mod error;
+pub mod handlers;
+pub mod models;
+pub mod state;
+pub mod persistence; 
+pub mod wal; 
 
 use state::AppState;
+
+#[cfg(test)]
+mod wal_integration_tests; // Added for in-crate integration tests
 
 #[tokio::main]
 async fn main() {
@@ -33,14 +39,21 @@ async fn main() {
     info!("Using persistence path: {:?}", persistence_path);
 
     // Create shared application state
-    let app_state = AppState::new(persistence_path.clone()); // Pass persistence_path to AppState::new
-    info!("Application state created.");
+    let app_state_instance = AppState::new(persistence_path.clone());
+    let app_state_arc = Arc::new(RwLock::new(app_state_instance));
+    info!("Application state created and wrapped in Arc<RwLock<>>.");
 
     // Load indices from disk
-    persistence::load_all_indices_on_startup(&app_state, &persistence_path).await;
+    // load_all_indices_on_startup expects &AppState. We need to pass a reference to the AppState inside the RwLock.
+    {
+        let app_state_guard = app_state_arc.read().await;
+        persistence::load_all_indices_on_startup(&*app_state_guard, &persistence_path).await;
+    }
+    
 
     // Define API routes
-    let app_state_clone_for_shutdown = app_state.clone(); // Clone for shutdown handler
+    let app_state_clone_for_router = app_state_arc.clone();
+    let app_state_clone_for_shutdown = app_state_arc.clone(); 
     let persistence_path_clone_for_shutdown = persistence_path.clone();
 
     let app = Router::new()
@@ -65,7 +78,7 @@ async fn main() {
         // Add middleware
         .layer(TraceLayer::new_for_http()) // Log requests/responses
         .layer(CorsLayer::permissive()) // Allow all origins (adjust for production)
-        .with_state(app_state); // Provide shared state to handlers
+        .with_state(app_state_clone_for_router); // Provide shared state to handlers
 
     // Define server address
     // TODO: Load from config file/env vars
@@ -74,15 +87,14 @@ async fn main() {
 
     // Run the server
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    
-    info!("Starting server on {}", addr);
+    // Removed duplicate info log: info!("Starting server on {}", addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(app_state_clone_for_shutdown, persistence_path_clone_for_shutdown))
         .await
         .unwrap();
 }
 
-async fn shutdown_signal(app_state: AppState, persistence_path: PathBuf) {
+async fn shutdown_signal(app_state_arc: Arc<RwLock<AppState>>, persistence_path: PathBuf) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -110,6 +122,10 @@ async fn shutdown_signal(app_state: AppState, persistence_path: PathBuf) {
     }
 
     info!("Saving all indices before shutdown...");
-    persistence::save_all_indices(&app_state, &persistence_path).await;
+    // save_all_indices expects &AppState. We need to pass a reference to the AppState inside the RwLock.
+    {
+        let app_state_guard = app_state_arc.read().await;
+        persistence::save_all_indices(&*app_state_guard, &persistence_path).await;
+    }
     info!("All indices saved. Shutting down.");
 }

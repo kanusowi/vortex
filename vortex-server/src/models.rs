@@ -24,7 +24,7 @@ pub struct AddVectorRequest {
 }
 
 /// Request body for searching vectors.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct SearchRequest {
     pub query_vector: Vec<f32>, // Accept standard Vec<f32>
     pub k: usize,

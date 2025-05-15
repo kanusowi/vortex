@@ -21,10 +21,21 @@ pub enum ServerError {
     CoreError(#[from] VortexError), // Automatically convert from VortexError
 
     #[error("Internal server error: {0}")]
+    #[allow(dead_code)] // May be used in future
     Internal(String),
 
     #[error("Failed to acquire lock: {0}")]
+    #[allow(dead_code)] // May be used in future
     LockError(String),
+
+    #[error("WAL error: {0}")]
+    WalError(String), // Added for WAL specific errors
+}
+
+impl From<crate::wal::wal_manager::WalError> for ServerError {
+    fn from(wal_error: crate::wal::wal_manager::WalError) -> Self {
+        ServerError::WalError(wal_error.to_string())
+    }
 }
 
 // Implement IntoResponse for ServerError to automatically convert errors into HTTP responses.
@@ -76,7 +87,11 @@ impl IntoResponse for ServerError {
              ServerError::LockError(msg) => {
                  error!(error=%msg, "Failed to acquire lock");
                  (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error (locking)".to_string())
-             }
+             },
+            ServerError::WalError(msg) => {
+                error!(error=%msg, "WAL operation error");
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Internal server error (WAL): {}", msg))
+            }
         };
 
         // Log the error before returning response

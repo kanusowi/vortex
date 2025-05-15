@@ -16,14 +16,17 @@ pub struct HnswConfig {
     pub ml: f64,
     /// Seed for the random number generator used for level assignment. If None, uses random seed.
     pub seed: Option<u64>,
+    /// Dimensionality of the vectors.
+    pub vector_dim: u32,
     // Add payload storage flag later if needed
     // pub store_payloads: bool,
 }
 
 impl HnswConfig {
     /// Creates a new HNSW configuration with default values derived from M.
-    pub fn new(m: usize, ef_construction: usize, ef_search: usize, ml: f64) -> Self {
+    pub fn new(vector_dim: u32, m: usize, ef_construction: usize, ef_search: usize, ml: f64) -> Self {
         HnswConfig {
+            vector_dim,
             m,
             m_max0: m * 2, // Default heuristic
             ef_construction,
@@ -50,6 +53,9 @@ impl HnswConfig {
         if self.ml <= 0.0 {
              return Err(VortexError::Configuration("ml must be greater than 0".to_string()));
         }
+        if self.vector_dim == 0 {
+            return Err(VortexError::Configuration("vector_dim must be greater than 0".to_string()));
+        }
         Ok(())
     }
 }
@@ -58,6 +64,7 @@ impl HnswConfig {
 impl Default for HnswConfig {
     fn default() -> Self {
         HnswConfig {
+            vector_dim: 0, // User must set this, or it's set during index creation. 0 is invalid.
             m: 16,
             m_max0: 32,
             ef_construction: 200,
@@ -73,7 +80,9 @@ mod tests {
     use super::*;
 
     fn valid_config() -> HnswConfig {
-        HnswConfig::default()
+        let mut config = HnswConfig::default();
+        config.vector_dim = 128; // Set a valid dimension
+        config
     }
 
     #[test]
@@ -125,11 +134,13 @@ mod tests {
 
     #[test]
     fn test_hnsw_config_new() {
+        let dim = 128;
         let m = 10;
         let ef_c = 100;
         let ef_s = 20;
         let ml = 0.5;
-        let config = HnswConfig::new(m, ef_c, ef_s, ml);
+        let config = HnswConfig::new(dim, m, ef_c, ef_s, ml);
+        assert_eq!(config.vector_dim, dim);
         assert_eq!(config.m, m);
         assert_eq!(config.m_max0, m * 2);
         assert_eq!(config.ef_construction, ef_c);

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::PathBuf; // Added PathBuf
 use std::sync::Arc;
 use tokio::sync::RwLock;
-// Using concrete HnswIndex type wrapped in RwLock for mutable access
 use vortex_core::{HnswIndex, VectorId};
 use serde_json::Value;
+use crate::wal::wal_manager::CollectionWalManager; // Corrected path
 
 /// Holds the shared state accessible by all request handlers.
 ///
@@ -22,6 +22,8 @@ pub struct AppState {
     // Stores metadata associated with vectors.
     // Keyed by index name, then by VectorId.
     pub metadata_store: Arc<RwLock<HashMap<String, HashMap<VectorId, Value>>>>,
+    // Stores WAL managers for each index
+    pub wal_managers: Arc<RwLock<HashMap<String, Arc<CollectionWalManager>>>>,
 }
 
 impl AppState {
@@ -31,6 +33,7 @@ impl AppState {
             data_path,
             indices: Arc::new(RwLock::new(HashMap::new())),
             metadata_store: Arc::new(RwLock::new(HashMap::new())),
+            wal_managers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

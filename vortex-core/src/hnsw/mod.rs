@@ -13,7 +13,13 @@ use std::cmp::Ordering;
 use ndarray::ArrayView1;
 
 // --- Data Structures for Search ---
-// Duplicate import blocks removed.
+
+/// Represents a single search result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResult { // Made pub
+    pub id: String, // Assuming VectorId is String
+    pub distance: f32,
+}
 
 /// Represents an item in the priority queue used during search.
 /// Stores (distance, node_index). Ordered by distance.
@@ -116,10 +122,10 @@ pub(crate) fn search_layer(
         )));
     }
     
-    let entry_vector_opt = vector_storage.get_vector(entry_point_id); // Removed ?
-    let entry_vector = entry_vector_opt.ok_or_else(|| VortexError::Internal(format!(
-        "Entry point ID {} not found in vector storage for layer {}.", entry_point_id, layer_idx
-    )))?;
+    let entry_vector = vector_storage.get_vector(entry_point_id) // Removed ? from here
+        .ok_or_else(|| VortexError::Internal(format!( 
+            "Entry point ID {} not found in vector storage for layer {}.", entry_point_id, layer_idx
+    )))?; // Added ? here
 
     let dist = calculate_distance(distance_metric, query_vector, entry_vector.view())?;
     let score = heap_score(distance_metric, dist);
@@ -154,10 +160,10 @@ pub(crate) fn search_layer(
                     continue; // Skip deleted nodes
                 }
 
-                let neighbor_vector_opt = vector_storage.get_vector(neighbor_id); // Removed ?
-                let neighbor_vector = neighbor_vector_opt.ok_or_else(|| VortexError::Internal(format!(
-                    "Neighbor ID {} (from graph links) not found in vector storage for layer {}.", neighbor_id, layer_idx
-                )))?;
+                let neighbor_vector = vector_storage.get_vector(neighbor_id) // Removed ? from here
+                    .ok_or_else(|| VortexError::Internal(format!( 
+                        "Neighbor ID {} (from graph links) not found in vector storage for layer {}.", neighbor_id, layer_idx
+                )))?; // Added ? here
 
                 let neighbor_dist = calculate_distance(distance_metric, query_vector, neighbor_vector.view())?;
                 let neighbor_heap_score = heap_score(distance_metric, neighbor_dist);

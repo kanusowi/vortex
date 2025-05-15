@@ -17,9 +17,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0" # Added serde_json
 thiserror = "1.0"
 tracing = "0.1"
+tokio = { workspace = true, features = ["sync"] } # Added for RwLock
+futures = { workspace = true } # Added for block_on
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] } # Needed for async benchmarks
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] } # Needed for async benchmarks, keep full features here
 tempfile = "3.10" # Or use workspace version if available and suitable
 criterion = { version = "0.5", features = ["html_reports"] }
 

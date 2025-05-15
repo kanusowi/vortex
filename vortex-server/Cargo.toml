@@ -16,3 +16,20 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 tower-http = { workspace = true }
 hyper = { workspace = true }
+# wal = "1.0" # Removed, as we are building our own WAL module
+serde_cbor = "0.11"
+
+# Dependencies for custom WAL implementation (inspired by Qdrant's WAL)
+byteorder = "1.5"
+crc32c = "0.6.8"
+# log = "0.4" # Already in workspace
+memmap2 = "0.9.5" # Specify version directly, same as vortex-core
+rand = { workspace = true } # This is fine as rand is in workspace.dependencies
+fs4 = "0.12.0"
+rustix = { version = "0.38", features = [ "fs", "time" ] } # Needed for ftruncate and other fs ops, Qdrant uses 0.36, latest is ~0.38
+crossbeam-channel = "0.5"
+futures = "0.3" # For futures::executor::block_on
+
+[dev-dependencies]
+tempfile = "3.10.1" # For tests
+env_logger = "0.11.3" # For test logging

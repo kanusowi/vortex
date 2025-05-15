@@ -10,6 +10,7 @@ use ndarray::Array1;
 
 use crate::error::VortexError;
 use crate::vector::Embedding;
+// use tracing::warn; // Removed unused warn
 
 const CURRENT_VERSION: u16 = 1;
 const DATA_FILE_MAGIC: &[u8; 6] = b"VTXVEC";
@@ -132,7 +133,7 @@ impl DeletionFileHeader {
 pub struct MmapVectorStorage {
     data_mmap: MmapMut,
     deletion_flags_mmap: MmapMut,
-    header: MmapFileHeader,
+    header: MmapFileHeader, // In-memory copy of the data file header
     _data_file: File, 
     _deletion_flags_file: File,
     _data_file_path: PathBuf,
@@ -153,15 +154,15 @@ impl MmapVectorStorage {
         let total_data_size = size_of::<MmapFileHeader>() as u64 + capacity * vector_size_bytes as u64;
         let total_deletion_flags_size = size_of::<DeletionFileHeader>() as u64 + capacity; 
 
-        let data_file = OpenOptions::new().read(true).write(true).create(true).open(&data_file_path)?;
+        let data_file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&data_file_path)?;
         data_file.set_len(total_data_size)?;
 
-        let mut deletion_flags_file = OpenOptions::new().read(true).write(true).create(true).open(&deletion_file_path)?;
+        let mut deletion_flags_file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&deletion_file_path)?;
         deletion_flags_file.set_len(total_deletion_flags_size)?;
         
         // Initialize deletion flags to 1 (deleted)
         deletion_flags_file.seek(SeekFrom::Start(size_of::<DeletionFileHeader>() as u64))?;
-        let buffer = vec![1u8; capacity as usize]; // Removed mut
+        let buffer = vec![1u8; capacity as usize]; 
         deletion_flags_file.write_all(&buffer)?;
         deletion_flags_file.flush()?;
 
@@ -248,15 +249,26 @@ impl MmapVectorStorage {
         Some(Embedding(Array1::from_iter(f32_slice.iter().cloned())))
     }
 
+    /// Writes the current in-memory `self.header` to the data_mmap buffer.
+    /// Does NOT flush the mmap to disk.
+    fn write_header_to_mmap(&mut self) -> Result<(), VortexError> {
+        let header_bytes = self.header.as_bytes();
+        if self.data_mmap.len() < header_bytes.len() {
+            return Err(VortexError::StorageError("Data mmap is too small to write header.".into()));
+        }
+        self.data_mmap[..header_bytes.len()].copy_from_slice(header_bytes);
+        Ok(())
+    }
+
     pub fn put_vector(&mut self, internal_id: u64, vector: &Embedding) -> Result<(), VortexError> {
-        let header_capacity = self.header.capacity; // Copy for safe access
+        let header_capacity = self.header.capacity; 
         if internal_id >= header_capacity {
             return Err(VortexError::StorageError(format!(
                 "Internal ID {} out of bounds for capacity {}",
                 internal_id, header_capacity
             )));
         }
-        let header_dim = self.header.dimensionality; // Copy for safe access
+        let header_dim = self.header.dimensionality; 
         if vector.dim() != header_dim as usize {
             return Err(VortexError::Configuration(format!( 
                 "Vector dimension mismatch: expected {}, got {}",
@@ -290,15 +302,17 @@ impl MmapVectorStorage {
         self.deletion_flags_mmap[del_offset] = 0; // Mark as not deleted
 
         if was_previously_marked_deleted {
-             self.header.vector_count += 1; // A previously deleted or unused slot is now active
+             self.header.vector_count += 1; 
         }
-        // If !was_previously_marked_deleted, it's an overwrite of an active vector, so vector_count doesn't change.
+        
+        // Write the updated header to the mmap buffer
+        self.write_header_to_mmap()?;
         Ok(())
     }
 
     /// Marks a vector as deleted. Returns true if the vector was active and is now marked as deleted.
     pub fn delete_vector(&mut self, internal_id: u64) -> Result<bool, VortexError> {
-        let header_capacity = self.header.capacity; // Copy for safe access
+        let header_capacity = self.header.capacity; 
         if internal_id >= header_capacity {
             return Err(VortexError::StorageError(format!(
                 "Internal ID {} out of bounds for capacity {}",
@@ -318,9 +332,11 @@ impl MmapVectorStorage {
             if self.header.vector_count > 0 { 
                 self.header.vector_count -= 1;
             }
-            Ok(true) // Vector was active and is now deleted
+            // Write the updated header to the mmap buffer
+            self.write_header_to_mmap()?;
+            Ok(true) 
         } else {
-            Ok(false) // Vector was already deleted (or slot was never used)
+            Ok(false) 
         }
     }
 
@@ -332,16 +348,11 @@ impl MmapVectorStorage {
         self.deletion_flags_mmap.flush().map_err(|e| VortexError::StorageError(format!("Failed to flush deletion_flags mmap: {}", e)))
     }
 
-    /// Flushes the current in-memory header to the data mmap.
-    /// This method takes `&mut self` because writing to the mmap slice requires a mutable borrow of `self.data_mmap`.
+    /// Flushes the current in-memory header to the data mmap on disk.
     pub fn flush_header(&mut self) -> Result<(), VortexError> {
-        let header_bytes = self.header.as_bytes();
-        if self.data_mmap.len() < header_bytes.len() {
-            return Err(VortexError::StorageError("Data mmap is too small to write header.".into()));
-        }
-        self.data_mmap[..header_bytes.len()].copy_from_slice(header_bytes);
-        // Use flush_range for potentially better performance if only header changed.
-        self.data_mmap.flush_range(0, header_bytes.len())
+        self.write_header_to_mmap()?; // Write to mmap buffer first
+        // Then flush the range of the mmap buffer containing the header to disk.
+        self.data_mmap.flush_range(0, size_of::<MmapFileHeader>())
             .map_err(|e| VortexError::StorageError(format!("Failed to flush header to data mmap: {}", e)))?;
         Ok(())
     }
@@ -402,7 +413,7 @@ impl MmapVectorStorage {
         Ok(Self {
             data_mmap,
             deletion_flags_mmap,
-            header: data_header, 
+            header: data_header, // This is the header read from disk
             _data_file: data_file,
             _deletion_flags_file: deletion_flags_file,
             _data_file_path: data_file_path,
