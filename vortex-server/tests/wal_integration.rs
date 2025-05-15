@@ -83,11 +83,11 @@ async fn test_wal_recovery_simple_operations() {
         // unwrap the Result, then unwrap the Option to get Embedding
         assert_eq!(retrieved_vector_result.unwrap().unwrap(), vortex_core::vector::Embedding::from(vector_data1.clone())); // Compare Embedding with Embedding
         
-        // Extend lifetime of metadata_store_guard
-        let metadata_store_guard = app_state_guard.metadata_store.read().await;
-        let metadata_for_index = metadata_store_guard.get(&index_name).unwrap();
-        let retrieved_metadata = metadata_for_index.get(&vector_id1).unwrap();
-        assert_eq!(retrieved_metadata, metadata1.as_ref().unwrap()); // Compare with &Value
+        // Verify metadata using PayloadIndexRocksDB
+        let payload_indices_guard = app_state_guard.payload_indices.read().await;
+        let payload_db = payload_indices_guard.get(&index_name).expect("Payload DB not found for index");
+        let retrieved_payload = payload_db.get_payload(&vector_id1).expect("Failed to get payload from RocksDB").expect("Payload not found in RocksDB for vector_id1");
+        assert_eq!(&retrieved_payload, metadata1.as_ref().unwrap()); // Compare with &Value
 
     } // AppState is dropped here, simulating server shutdown/crash without explicit save
 
@@ -119,12 +119,11 @@ async fn test_wal_recovery_simple_operations() {
         // unwrap the Result, then unwrap the Option to get Embedding
         assert_eq!(retrieved_vector_restarted_result.unwrap().unwrap(), vortex_core::vector::Embedding::from(vector_data1.clone()), "Vector data mismatch after WAL recovery");
 
-        let metadata_store_restarted_guard = app_state_restarted_guard.metadata_store.read().await;
-        let metadata_for_index_restarted = metadata_store_restarted_guard.get(&index_name);
-        assert!(metadata_for_index_restarted.is_some(), "Metadata for index should exist after WAL recovery");
-        let retrieved_metadata_restarted = metadata_for_index_restarted.unwrap().get(&vector_id1);
-        assert!(retrieved_metadata_restarted.is_some(), "Metadata for vector should be recoverable from WAL");
-        assert_eq!(retrieved_metadata_restarted.unwrap(), metadata1.as_ref().unwrap(), "Metadata mismatch after WAL recovery");
+        // Verify metadata using PayloadIndexRocksDB after restart
+        let payload_indices_restarted_guard = app_state_restarted_guard.payload_indices.read().await;
+        let payload_db_restarted = payload_indices_restarted_guard.get(&index_name).expect("Payload DB not found for index after restart");
+        let retrieved_payload_restarted = payload_db_restarted.get_payload(&vector_id1).expect("Failed to get payload from RocksDB after restart").expect("Payload not found in RocksDB for vector_id1 after restart");
+        assert_eq!(&retrieved_payload_restarted, metadata1.as_ref().unwrap(), "Metadata mismatch after WAL recovery");
 
         // Further checks: e.g., search for the vector
         let search_req = SearchRequest {

@@ -11,15 +11,12 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-pub mod config; 
-pub mod error;
-pub mod handlers;
-pub mod models;
-pub mod state;
-pub mod persistence; 
-pub mod wal; 
-
-use state::AppState;
+// Use modules from the vortex_server library
+use vortex_server::handlers;
+ // Make the state module available for persistence::calls
+use vortex_server::state::AppState; // Make AppState type directly available for AppState::new
+use vortex_server::persistence;
+// Note: The original `use state::AppState;` is now covered by `use vortex_server::state::AppState;`
 
 #[cfg(test)]
 mod wal_integration_tests; // Added for in-crate integration tests

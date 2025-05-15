@@ -30,6 +30,9 @@ pub enum ServerError {
 
     #[error("WAL error: {0}")]
     WalError(String), // Added for WAL specific errors
+
+    #[error("RocksDB error: {0}")]
+    RocksDBError(String),
 }
 
 impl From<crate::wal::wal_manager::WalError> for ServerError {
@@ -91,6 +94,10 @@ impl IntoResponse for ServerError {
             ServerError::WalError(msg) => {
                 error!(error=%msg, "WAL operation error");
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("Internal server error (WAL): {}", msg))
+            },
+            ServerError::RocksDBError(msg) => {
+                error!(error=%msg, "RocksDB operation error");
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Internal server error (Payload DB): {}", msg))
             }
         };
 

@@ -18,6 +18,7 @@ tower-http = { workspace = true }
 hyper = { workspace = true }
 # wal = "1.0" # Removed, as we are building our own WAL module
 serde_cbor = "0.11"
+rocksdb = { version = "0.22.0", features = ["snappy", "lz4"] }
 
 # Dependencies for custom WAL implementation (inspired by Qdrant's WAL)
 byteorder = "1.5"

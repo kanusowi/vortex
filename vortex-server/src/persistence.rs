@@ -1,8 +1,9 @@
 use crate::state::AppState;
 use crate::error::{ServerError, ServerResult}; 
-use crate::wal::wal_manager::{CollectionWalManager, WalRecord}; // Corrected path, removed WalError
-use crate::wal::VortexWalOptions; 
-use vortex_core::{VortexError, VectorId}; // Added VectorId
+use crate::wal::wal_manager::{CollectionWalManager, WalRecord};
+use crate::wal::VortexWalOptions;
+use vortex_core::{VortexError, VectorId};
+use crate::payload_index::PayloadIndexRocksDB; // Added
 use serde::{Serialize, Deserialize}; // Added Serialize, Deserialize
 use std::collections::HashMap; // Added HashMap
 use std::fs::{self, File};
@@ -167,7 +168,8 @@ pub async fn load_all_indices_on_startup(app_state: &AppState, persistence_path:
         Ok(entries) => {
             let mut indices_map_guard = app_state.indices.write().await;
             let mut metadata_store_guard = app_state.metadata_store.write().await;
-            let mut wal_managers_guard = app_state.wal_managers.write().await; // Lock for WAL managers
+            let mut wal_managers_guard = app_state.wal_managers.write().await;
+            let mut payload_indices_guard = app_state.payload_indices.write().await; // Lock for payload_indices
 
             for entry_result in entries {
                 match entry_result {
@@ -297,6 +299,21 @@ pub async fn load_all_indices_on_startup(app_state: &AppState, persistence_path:
                                         loaded_count += 1;
                                         // Metadata (payloads) already loaded and stored above.
                                         // No separate error count for metadata now, as it's part of IndexServerMetadata.
+
+                                        // Initialize PayloadIndexRocksDB
+                                        let index_data_path = persistence_path.join(&index_name);
+                                        let payload_db_path = index_data_path.join("payload_db");
+                                        match PayloadIndexRocksDB::new(&payload_db_path) {
+                                            Ok(payload_idx_db) => {
+                                                payload_indices_guard.insert(index_name.clone(), Arc::new(payload_idx_db));
+                                                info!(index_name, path=?payload_db_path, "PayloadIndexRocksDB initialized successfully.");
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(index_name, path=?payload_db_path, error=?e, "Failed to initialize PayloadIndexRocksDB for index. Payloads may not be available.");
+                                                // Decide if this is a fatal error for loading the index or just a warning.
+                                                // For now, let the index load without payload DB if it fails.
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::error!(index_name, file_path = ?path, error = ?e, "Failed to load HNSW index data.");

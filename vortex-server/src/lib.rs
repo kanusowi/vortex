@@ -7,6 +7,7 @@ pub mod models;
 pub mod persistence;
 pub mod state;
 pub mod wal;
+pub mod payload_index;
 // wal_manager is part of the wal module, so it's accessible via pub mod wal;
 // wal_integration_tests.rs is a test file, not typically part of lib.rs
 

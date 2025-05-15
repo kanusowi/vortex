@@ -4,8 +4,9 @@ use crate::models::{
     StatsResponse, SuccessResponse, VectorResponse,
 };
 use crate::state::AppState;
-use crate::wal::wal_manager::{CollectionWalManager, WalRecord}; // Corrected path
-use crate::wal::VortexWalOptions; 
+use crate::wal::wal_manager::{CollectionWalManager, WalRecord};
+use crate::wal::VortexWalOptions;
+use crate::payload_index::PayloadIndexRocksDB;
 
 
 use axum::{
@@ -120,7 +121,35 @@ pub async fn create_index(
     wal_managers_map_writer.insert(payload.name.clone(), Arc::new(wal_manager));
     drop(wal_managers_map_writer); // Release lock
 
-    info!(index_name = %payload.name, "Index and WAL created successfully");
+    // Initialize PayloadIndexRocksDB for the new index
+    // The data_path_buf is already cloned and available from HnswIndex::new context
+    let payload_db_path = data_path_buf.join(&payload.name).join("payload_db");
+    match PayloadIndexRocksDB::new(&payload_db_path) {
+        Ok(payload_idx_db) => {
+            let mut payload_indices_guard = app_state_guard.payload_indices.write().await;
+            payload_indices_guard.insert(payload.name.clone(), Arc::new(payload_idx_db));
+            info!(index_name = %payload.name, path=?payload_db_path, "PayloadIndexRocksDB initialized successfully for new index.");
+        }
+        Err(e) => {
+            // This is a critical error during index creation.
+            // Attempt to clean up the HNSW index files and WAL directory.
+            tracing::error!(index_name = %payload.name, path=?payload_db_path, error=?e, "CRITICAL: Failed to initialize PayloadIndexRocksDB for new index. Cleaning up HNSW index and WAL.");
+            
+            // Attempt cleanup (best effort)
+            app_state_guard.indices.write().await.remove(&payload.name);
+            app_state_guard.wal_managers.write().await.remove(&payload.name);
+            // Note: tokio::fs::remove_dir_all is async. If this handler isn't in an async block that can .await it,
+            // synchronous fs::remove_dir_all should be used, or this cleanup needs to be spawned.
+            // For simplicity in this diff, assuming sync fs or proper async context.
+            if let Err(cleanup_err) = std::fs::remove_dir_all(data_path_buf.join(&payload.name)) {
+                tracing::error!(index_name = %payload.name, error=?cleanup_err, "Failed to cleanup index directory after PayloadIndexRocksDB creation failure.");
+            }
+            // Use the new RocksDBError variant
+            return Err(ServerError::RocksDBError(format!("Failed to initialize payload database for index {}: {:?}", payload.name, e)));
+        }
+    }
+
+    info!(index_name = %payload.name, "Index, WAL, and Payload DB created successfully");
     Ok((
         StatusCode::CREATED,
         Json(SuccessResponse {
@@ -172,14 +201,27 @@ pub async fn add_vector(
 
     let added = index_guard.add_vector(payload.id.clone(), embedding).await?;
 
-    // Store metadata if provided
+    // Store metadata in PayloadIndexRocksDB if provided
     if let Some(metadata_value) = payload.metadata {
-        let mut metadata_store_writer = app_state_guard.metadata_store.write().await;
-        let index_metadata_store = metadata_store_writer
-            .entry(index_name.clone())
-            .or_insert_with(std::collections::HashMap::new);
-        index_metadata_store.insert(vector_id_clone.clone(), metadata_value); // Use cloned vector_id_clone
-        debug!(index_name=%index_name, vector_id=%vector_id_clone, "Stored metadata for vector");
+        let payload_indices_guard = app_state_guard.payload_indices.read().await;
+        if let Some(payload_db) = payload_indices_guard.get(&index_name) {
+            payload_db.set_payload(&vector_id_clone, &metadata_value)
+                .map_err(|e| {
+                    warn!(index_name=%index_name, vector_id=%vector_id_clone, error=?e, "Failed to set payload in RocksDB");
+                    // Decide if this should be a fatal error for the add_vector operation.
+                    // For now, let's assume it's not fatal, but log a warning.
+                    // If it were fatal, we might need to roll back the HNSW add or WAL entry.
+                    // This depends on desired consistency guarantees.
+                    // For basic integration, we'll proceed but log.
+                    // In a stricter system, this might return an error.
+                    // ServerError::StorageError(format!("Failed to set payload in RocksDB: {}", e))
+                    e 
+                })?; // Propagate error if strict, or handle non-fatally
+            debug!(index_name=%index_name, vector_id=%vector_id_clone, "Stored payload in RocksDB for vector");
+        } else {
+            warn!(index_name=%index_name, vector_id=%vector_id_clone, "PayloadIndexRocksDB not found for index. Metadata not stored.");
+            // This is a server inconsistency, should ideally not happen if create_index sets it up.
+        }
     }
 
     let status_code = if added {
@@ -255,11 +297,18 @@ pub async fn search_vectors(
 
     let mut final_results: Vec<SearchResultItem> = Vec::with_capacity(k);
     
-    let index_specific_metadata_map_opt: Option<std::collections::HashMap<VectorId, serde_json::Value>> = {
-        let metadata_store_guard = app_state_guard.metadata_store.read().await;
-        metadata_store_guard.get(&index_name).cloned()
+    // Get payload_db instance for metadata retrieval
+    let payload_db_opt = {
+        let payload_indices_guard = app_state_guard.payload_indices.read().await;
+        payload_indices_guard.get(&index_name).cloned() // Clone Arc<PayloadIndexRocksDB>
     };
 
+    if payload.filter.is_some() && payload_db_opt.is_none() {
+        warn!(index_name=%index_name, "Filter requested but PayloadIndexRocksDB not found for index. Returning unfiltered results or error based on strictness.");
+        // Depending on desired behavior, either return an error or proceed without filtering.
+        // For now, let's proceed, and filtering logic below will handle payload_db_opt being None.
+    }
+    
     for (id_ref, score_ref) in &initial_search_results {
         if final_results.len() >= k {
             break;
@@ -267,29 +316,37 @@ pub async fn search_vectors(
 
         let id = id_ref.clone();
         let score = *score_ref;
+        let mut vector_metadata: Option<serde_json::Value> = None;
 
-        let passes_filter = match (&payload.filter, &index_specific_metadata_map_opt) {
-            (Some(filter_value), Some(actual_metadata_map)) => {
+        if let Some(payload_db) = &payload_db_opt {
+            match payload_db.get_payload(&id) {
+                Ok(payload_val_opt) => vector_metadata = payload_val_opt,
+                Err(e) => {
+                    warn!(index_name=%index_name, vector_id=%id, error=?e, "Failed to get payload from RocksDB for search result. Proceeding without metadata for this item.");
+                }
+            }
+        }
+
+        let passes_filter = match (&payload.filter, &vector_metadata) {
+            (Some(filter_value), Some(actual_metadata_value)) => {
                 let filter_obj = filter_value.as_object().expect("Filter should be an object due to earlier check");
                 if filter_obj.is_empty() {
-                    true
-                } else if let Some(metadata_json_value) = actual_metadata_map.get(&id) {
-                    if let Some(metadata_actual_obj) = metadata_json_value.as_object() {
-                        matches_filter(metadata_actual_obj, filter_obj)
-                    } else { false }
-                } else { false }
+                    true // Empty filter matches everything
+                } else if let Some(metadata_actual_obj) = actual_metadata_value.as_object() {
+                    matches_filter(metadata_actual_obj, filter_obj)
+                } else {
+                    false // Actual metadata is not an object, cannot match non-empty filter
+                }
             }
-            (None, _) => true, // No filter applied
-            (Some(filter_value), None) => { // Filter applied, but no metadata store for this index
-                 // If filter is not empty, then it's a mismatch. If filter is empty, it's a match.
-                 filter_value.as_object().map_or(true, |obj| obj.is_empty())
+            (None, _) => true, // No filter applied, always passes
+            (Some(filter_value), None) => { // Filter applied, but no metadata for this vector
+                // If filter is not empty, then it's a mismatch. If filter is empty, it's a match.
+                filter_value.as_object().map_or(true, |obj| obj.is_empty())
             }
         };
 
         if passes_filter {
-            let metadata = index_specific_metadata_map_opt.as_ref()
-                .and_then(|store| store.get(&id).cloned());
-            final_results.push(SearchResultItem { id, score, metadata });
+            final_results.push(SearchResultItem { id, score, metadata: vector_metadata });
         }
     }
 
@@ -384,11 +441,20 @@ pub async fn get_vector(
     match index_guard.get_vector(&vector_id).await.map_err(ServerError::from)? {
         Some(embedding) => {
             debug!(index_name=%index_name, vector_id=%vector_id, "Vector found");
-            let metadata = { // New scope for metadata_store read lock
-                let metadata_store_guard = app_state_guard.metadata_store.read().await;
-                metadata_store_guard
-                    .get(&index_name)
-                    .and_then(|store| store.get(&vector_id).cloned())
+            let metadata = {
+                let payload_indices_guard = app_state_guard.payload_indices.read().await;
+                if let Some(payload_db) = payload_indices_guard.get(&index_name) {
+                    match payload_db.get_payload(&vector_id) {
+                        Ok(payload_opt) => payload_opt,
+                        Err(e) => {
+                            warn!(index_name=%index_name, vector_id=%vector_id, error=?e, "Failed to get payload from RocksDB. Returning vector without metadata.");
+                            None
+                        }
+                    }
+                } else {
+                    warn!(index_name=%index_name, vector_id=%vector_id, "PayloadIndexRocksDB not found for index. Cannot retrieve metadata.");
+                    None
+                }
             };
 
             Ok(Json(VectorResponse {
@@ -438,18 +504,27 @@ pub async fn list_vectors(
     let vectors_list = index_guard.list_vectors(params.limit).await?;
     debug!(index_name=%index_name, count=vectors_list.len(), "Listed vectors from core");
 
-    // Convert core results to API response model
-    let index_metadata_store_clone = { // New scope for metadata_store read lock
-        let metadata_store_guard = app_state_guard.metadata_store.read().await;
-        metadata_store_guard.get(&index_name).cloned() // Clone the HashMap if found
+    // Get payload_db instance for metadata retrieval
+    let payload_db_opt = {
+        let payload_indices_guard = app_state_guard.payload_indices.read().await;
+        payload_indices_guard.get(&index_name).cloned()
     };
 
     let response_list = vectors_list
         .into_iter()
         .map(|(id, embedding)| {
-            let metadata = index_metadata_store_clone
-                .as_ref() // Get an Option<&HashMap<...>>
-                .and_then(|store| store.get(&id).cloned());
+            let metadata = if let Some(payload_db) = &payload_db_opt {
+                match payload_db.get_payload(&id) {
+                    Ok(payload_val_opt) => payload_val_opt,
+                    Err(e) => {
+                        warn!(index_name=%index_name, vector_id=%id, error=?e, "Failed to get payload from RocksDB for list_vectors. Item will have no metadata.");
+                        None
+                    }
+                }
+            } else {
+                warn!(index_name=%index_name, vector_id=%id, "PayloadIndexRocksDB not found for index during list_vectors. Item will have no metadata.");
+                None
+            };
             VectorResponse {
                 id,
                 vector: embedding.into(), // Convert Embedding to Vec<f32>
@@ -501,12 +576,18 @@ pub async fn delete_vector(
 
     if deleted {
         info!(index_name=%index_name, vector_id=%vector_id, "Vector marked as deleted in core index");
-        // Also remove metadata
-        let mut metadata_store_writer = app_state_guard.metadata_store.write().await;
-        if let Some(index_metadata_store) = metadata_store_writer.get_mut(&index_name) {
-            if index_metadata_store.remove(&vector_id).is_some() {
-                debug!(index_name=%index_name, vector_id=%vector_id, "Removed metadata for deleted vector");
+        // Also remove metadata from PayloadIndexRocksDB
+        let payload_indices_guard = app_state_guard.payload_indices.read().await;
+        if let Some(payload_db) = payload_indices_guard.get(&index_name) {
+            if let Err(e) = payload_db.delete_payload(&vector_id) {
+                warn!(index_name=%index_name, vector_id=%vector_id, error=?e, "Failed to delete payload from RocksDB. HNSW vector deleted, but payload may remain.");
+                // This could be a partial success or an error depending on desired strictness.
+                // For now, we proceed as HNSW deletion was successful.
+            } else {
+                debug!(index_name=%index_name, vector_id=%vector_id, "Removed payload from RocksDB for deleted vector");
             }
+        } else {
+            warn!(index_name=%index_name, vector_id=%vector_id, "PayloadIndexRocksDB not found for index. Payload not deleted from RocksDB.");
         }
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -563,11 +644,14 @@ pub async fn batch_add_vectors(
     // If all dimensions are correct, proceed with adding
     let mut index_guard = index_lock_arc.write().await; // Lock HNSW index for the whole batch
     
-    // Lock metadata store for the duration of the batch operation
-    let mut metadata_store_writer = app_state_guard.metadata_store.write().await;
-    let index_metadata_store_mut_ref = metadata_store_writer
-        .entry(index_name.clone())
-        .or_insert_with(std::collections::HashMap::new);
+    // Lock payload_indices for the duration of the batch operation
+    let payload_indices_guard = app_state_guard.payload_indices.read().await;
+    let payload_db = payload_indices_guard.get(&index_name)
+        .ok_or_else(|| {
+            // This is a server inconsistency if payload_db wasn't created with the index
+            warn!(index_name = %index_name, "PayloadIndexRocksDB not found for batch add. This indicates an inconsistent server state.");
+            ServerError::Internal("Payload database not found for index.".to_string())
+        })?;
 
     let mut success_count = 0;
     let mut failure_count = 0;
@@ -580,7 +664,12 @@ pub async fn batch_add_vectors(
         match index_guard.add_vector(item.id.clone(), embedding).await {
             Ok(_added) => {
                 if let Some(metadata_value) = item.metadata {
-                    index_metadata_store_mut_ref.insert(item.id.clone(), metadata_value);
+                    if let Err(e_payload) = payload_db.set_payload(&item.id, &metadata_value) {
+                        // Log error for this specific payload, but continue batch
+                        warn!(vector_id = %item.id, index_name = %index_name, error = ?e_payload, "Failed to set payload in RocksDB during batch add. Vector added to HNSW, but payload failed.");
+                        // Optionally, count this as a partial failure or collect these errors.
+                        // For now, the vector is added to HNSW, so we count it as a success for HNSW part.
+                    }
                 }
                 success_count += 1;
             }

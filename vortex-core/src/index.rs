@@ -5,7 +5,7 @@ use crate::error::{VortexError, VortexResult};
 // TODO: Re-evaluate hnsw module usage once HNSW logic is integrated here
 // use crate::hnsw::{SearchResult}; // Import SearchResult, removed self - Now unused
 use crate::vector::{Embedding, VectorId};
-use crate::utils::{create_rng}; 
+// use crate::utils::{create_rng}; // Removed as _rng field is gone
 // calculate_distance removed
 // use crate::storage::mmap_vector_storage::MmapVectorStorage; // Unused
 // use crate::storage::mmap_hnsw_graph_links::MmapHnswGraphLinks; // Unused
@@ -15,7 +15,7 @@ use tokio::sync::RwLock; // Added RwLock
 
 use async_trait::async_trait;
 // ndarray::ArrayView1 removed
-use rand::rngs::StdRng; // Uncommented for HnswIndex.rng field
+// use rand::rngs::StdRng; // Removed as _rng field is gone
 use serde::{Serialize, Deserialize}; // Added serde imports
 use std::collections::HashMap; // Used for HnswIndexMetadata
 use std::fs; // Added fs import
@@ -79,7 +79,7 @@ pub struct HnswIndex {
     // vector_storage: MmapVectorStorage, // Moved to SimpleSegment
     // graph_links: MmapHnswGraphLinks, // Moved to SimpleSegment
     // vector_map: HashMap<VectorId, u64>, // Each segment will have its own, or HnswIndex aggregates
-    _rng: StdRng, // For operations like random level generation if not delegated
+    // _rng: StdRng, // Removed as it's unused at HnswIndex level
     // total_vectors_inserted_count: u64, // Might be managed per segment or globally
 
     segments: Vec<Arc<RwLock<SimpleSegment>>>, // Manages one or more segments
@@ -154,7 +154,7 @@ impl HnswIndex {
             path: index_path,
             config, 
             metric,
-            _rng: create_rng(config.seed),
+            // _rng: create_rng(config.seed), // Removed
             segments,
         };
         
@@ -217,7 +217,7 @@ impl HnswIndex {
             path: index_path,
             config: loaded_config, 
             metric: loaded_metric, 
-            _rng: create_rng(loaded_config.seed),
+            // _rng: create_rng(loaded_config.seed), // Removed
             segments,
         })
     }
@@ -420,31 +420,20 @@ impl Index for HnswIndex {
         self.metric
     }
 
-    async fn list_vectors(&self, _limit: Option<usize>) -> VortexResult<Vec<(VectorId, Embedding)>> {
-        warn!("HnswIndex::list_vectors (segment-based) may be inefficient and is currently basic.");
+    async fn list_vectors(&self, limit: Option<usize>) -> VortexResult<Vec<(VectorId, Embedding)>> {
         if self.segments.is_empty() {
+            debug!("HnswIndex::list_vectors called on an index with no segments.");
             return Ok(Vec::new());
         }
+        
         // For now, list from the first segment.
-        // Later, this needs to aggregate from all segments respecting the limit.
-        let _segment = self.segments[0].read().await;
-        // Segment::list_vectors would be needed.
-        // For now, this is a placeholder as Segment trait doesn't have list_vectors.
-        // This test will likely need to be adapted or Segment trait enhanced.
-        // Let's assume Segment will get a list_vectors method.
-        // For now, returning empty to compile.
-        // segment.list_vectors(limit).await 
-        // Ok(Vec::new()) // Placeholder
-        // Updated: SimpleSegment now has vector_map, let's try to use it if accessible
-        // This is still a hack, Segment trait should define this.
-        let results = Vec::new();
-        let _count = 0;
-        // This direct access to segment.vector_map is problematic and was an error.
-        // The Segment trait needs a list_vectors method.
-        // For now, to fix the immediate compile error, I'll comment out the problematic loop.
-        // This means list_vectors will return empty, and tests for it will fail or need adjustment.
-        warn!("HnswIndex::list_vectors is returning empty due to ongoing refactor.");
-        Ok(results)
+        // TODO: Implement aggregation from multiple segments if/when HnswIndex supports multiple active segments for listing.
+        // This might involve collecting from each segment and then applying a global limit,
+        // or distributing the limit among segments.
+        
+        let segment = self.segments[0].read().await;
+        debug!(segment_path=?segment.path(), ?limit, "HnswIndex::list_vectors delegating to segment 0.");
+        segment.list_vectors(limit).await
     }
 }
 
@@ -689,5 +678,48 @@ mod tests {
             }
             _ => panic!("Expected StorageError for corrupted index metadata."),
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_vectors_via_hnsw_index() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path();
+        let mut config = create_test_config();
+        config.vector_dim = 2; // For consistency with embeddings
+        let index_name = "test_list_vectors_idx_segmented";
+        
+        let mut index = HnswIndex::new(base_path, index_name, config, DistanceMetric::L2).await.unwrap();
+
+        // Test on empty index
+        let listed_empty = index.list_vectors(None).await.unwrap();
+        assert!(listed_empty.is_empty(), "list_vectors on empty index should be empty");
+        let listed_empty_limit = index.list_vectors(Some(5)).await.unwrap();
+        assert!(listed_empty_limit.is_empty(), "list_vectors with limit on empty index should be empty");
+
+        // Add some vectors
+        let vec1 = ("id_list_1".to_string(), Embedding::from(vec![1.0, 1.0]));
+        let vec2 = ("id_list_2".to_string(), Embedding::from(vec![2.0, 2.0]));
+        let vec3 = ("id_list_3".to_string(), Embedding::from(vec![3.0, 3.0]));
+
+        index.add_vector(vec1.0.clone(), vec1.1.clone()).await.unwrap();
+        index.add_vector(vec2.0.clone(), vec2.1.clone()).await.unwrap();
+        index.add_vector(vec3.0.clone(), vec3.1.clone()).await.unwrap();
+
+        // Test list_vectors with no limit
+        let listed_all = index.list_vectors(None).await.unwrap();
+        assert_eq!(listed_all.len(), 3, "Should list all 3 vectors from HnswIndex");
+        assert!(listed_all.iter().any(|(id, _)| id == &vec1.0));
+        assert!(listed_all.iter().any(|(id, _)| id == &vec2.0));
+        assert!(listed_all.iter().any(|(id, _)| id == &vec3.0));
+
+        // Test list_vectors with limit
+        let listed_limit_2 = index.list_vectors(Some(2)).await.unwrap();
+        assert_eq!(listed_limit_2.len(), 2, "Should list 2 vectors with limit 2 from HnswIndex");
+
+        // Test list_vectors after deletion
+        index.delete_vector(&vec2.0).await.unwrap();
+        let listed_after_delete = index.list_vectors(None).await.unwrap();
+        assert_eq!(listed_after_delete.len(), 2, "Should list 2 vectors after one deletion from HnswIndex");
+        assert!(!listed_after_delete.iter().any(|(id, _)| id == &vec2.0));
     }
 }

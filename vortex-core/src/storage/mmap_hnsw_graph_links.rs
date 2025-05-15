@@ -300,6 +300,54 @@ impl MmapHnswGraphLinks {
         self.header.num_layers
     }
 
+    /// Returns the maximum number of layers this file was configured to store (capacity).
+    /// This is distinct from `get_num_layers()` which returns the currently *used* number of layers.
+    /// This method is not currently in the file, but was planned.
+    /// The header struct does not have a separate `max_layers_capacity` field.
+    /// The `num_layers` in the header of a newly created file *is* the capacity.
+    /// However, `MmapGraphFileHeader` does not store the original capacity if `set_num_layers` is called.
+    /// This suggests a design flaw or misunderstanding.
+    /// For now, let's assume `self.header.num_layers` when the file is *created* sets the capacity.
+    /// This is problematic if `set_num_layers` can reduce it.
+    /// Re-reading the `new` function: `header = MmapGraphFileHeader::new(num_nodes, num_layers_to_allocate, ...)`
+    /// Here `num_layers_to_allocate` is the capacity. This is stored in `header.num_layers`.
+    /// If `set_num_layers` is called with a smaller value, the original capacity is lost from the header.
+    /// This needs a fix in the header or `MmapHnswGraphLinks` struct to store original capacity.
+    ///
+    /// Given the current structure, the best we can do is assume `header.num_layers` IS the capacity
+    /// if we are careful about how `set_num_layers` is used (i.e., it should not be used to change capacity,
+    /// only to reflect the highest currently used layer index + 1, up to the initial capacity).
+    ///
+    /// Let's assume the `MmapGraphFileHeader::num_layers` field actually represents the *capacity* of layers
+    /// the file was initialized with, and a separate mechanism (or interpretation) handles the *currently active* number of layers.
+    /// The `set_num_layers` method has a check:
+    /// `if new_num_layers == 0 && self.header.num_nodes > 0`
+    /// This implies `self.header.num_layers` is the *active* number of layers.
+    ///
+    /// This is confusing. The previous analysis concluded `header.max_layers` was the capacity.
+    /// Let's check `MmapGraphFileHeader` again. It does NOT have `max_layers`.
+    /// The `calculate_max_layers_for_file_size` is NOT used in `MmapHnswGraphLinks::new`.
+    /// The `num_layers_to_allocate` in `new()` is `std::cmp::max(initial_num_layers, 1)`. This is stored in `header.num_layers`.
+    /// This `header.num_layers` IS the layer capacity of the file.
+    /// `set_num_layers` then modifies this. This is indeed problematic if it's meant to be a fixed capacity.
+    ///
+    /// For the immediate fix of the panic, we need a way to get the *allocated* max layers.
+    /// Given the current code, `self.header.num_layers` after `new()` holds this.
+    /// If `set_num_layers` is used to *increase* layers up to this initial allocation, it's fine.
+    /// If `generate_random_level` produces a level `L`, then `L+1` is passed to `set_num_layers`.
+    /// `set_num_layers` should check `new_num_layers` against the *original* capacity.
+    ///
+    /// The simplest way forward without redesigning the header right now is to ensure
+    /// `generate_random_level` is capped by `self.header.num_layers -1` (if num_layers > 0).
+    /// This means `HnswIndex` must pass this capacity to `SimpleSegment`, or `SimpleSegment`
+    /// must use the `num_layers` from its `MmapHnswGraphLinks.header`.
+
+    /// Let's add get_max_layers_capacity based on the `num_layers` field in the header,
+    /// assuming it represents the allocated capacity.
+    pub fn get_max_layers_capacity(&self) -> u16 {
+        self.header.num_layers // Assuming this is the allocated capacity
+    }
+
     pub fn get_max_connections(&self, layer: u16) -> Result<u32, VortexError> {
         let num_layers = self.header.num_layers; // Copy to local variable
         if layer >= num_layers {

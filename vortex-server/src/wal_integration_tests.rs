@@ -1,10 +1,9 @@
-use crate::state::AppState;
-// use crate::config::ServerConfig; // Unused import
-use crate::models::{CreateIndexRequest, AddVectorRequest, SearchRequest}; // Removed VectorResponse and SearchResponse
+use vortex_server::state::AppState;
+use std::sync::Arc;
+use vortex_server::models::{CreateIndexRequest, AddVectorRequest, SearchRequest}; // Removed VectorResponse and SearchResponse
 use serde_json::Value as JsonValue; // Using Value directly for metadata
 use vortex_core::index::Index;
 // use vortex_core::vector::VectorId; // Unused import
-use std::sync::Arc;
 use tokio::sync::RwLock;
 // use std::collections::HashMap; // Unused import
 use tempfile::tempdir;
@@ -85,9 +84,11 @@ async fn test_wal_recovery_simple_operations() {
         let retrieved_vector_opt = index_guard.get_vector(&vector_id1).await.expect("Failed to get vector before crash");
         assert_eq!(retrieved_vector_opt.expect("Vector not found before crash").0.to_vec(), vector_data1);
         
-        let metadata_store_guard = app_state_guard.metadata_store.read().await;
-        let index_meta_temp = metadata_store_guard.get(&index_name).unwrap();
-        assert_eq!(index_meta_temp.get(&vector_id1).unwrap(), &metadata1.clone().unwrap());
+        // Verify metadata using PayloadIndexRocksDB
+        let payload_indices_guard = app_state_guard.payload_indices.read().await;
+        let payload_db = payload_indices_guard.get(&index_name).expect("Payload DB not found for index");
+        let retrieved_payload = payload_db.get_payload(&vector_id1).expect("Failed to get payload from RocksDB").expect("Payload not found in RocksDB for vector_id1");
+        assert_eq!(retrieved_payload, metadata1.clone().unwrap());
 
 
     } // AppState is dropped here, simulating server shutdown/crash without explicit save
@@ -112,13 +113,12 @@ async fn test_wal_recovery_simple_operations() {
         assert!(retrieved_vector_restarted_res.is_ok() && retrieved_vector_restarted_res.as_ref().unwrap().is_some(), "Vector should be recoverable from WAL");
         assert_eq!(retrieved_vector_restarted_res.unwrap().unwrap().0.to_vec(), vector_data1, "Vector data mismatch after WAL recovery");
 
-        let metadata_store_restarted_guard = app_state_restarted_guard.metadata_store.read().await;
-        let metadata_for_index_restarted = metadata_store_restarted_guard.get(&index_name);
-        assert!(metadata_for_index_restarted.is_some(), "Metadata for index should exist after WAL recovery");
-        let retrieved_metadata_restarted = metadata_for_index_restarted.unwrap().get(&vector_id1);
-        assert!(retrieved_metadata_restarted.is_some(), "Metadata for vector should be recoverable from WAL");
-        assert_eq!(retrieved_metadata_restarted.unwrap(), &metadata1.clone().unwrap(), "Metadata mismatch after WAL recovery");
-
+        // Verify metadata using PayloadIndexRocksDB after restart
+        let payload_indices_restarted_guard = app_state_restarted_guard.payload_indices.read().await;
+        let payload_db_restarted = payload_indices_restarted_guard.get(&index_name).expect("Payload DB not found for index after restart");
+        let retrieved_payload_restarted = payload_db_restarted.get_payload(&vector_id1).expect("Failed to get payload from RocksDB after restart").expect("Payload not found in RocksDB for vector_id1 after restart");
+        assert_eq!(retrieved_payload_restarted, metadata1.clone().unwrap(), "Metadata mismatch after WAL recovery");
+        
         // Further checks: e.g., search for the vector
         let search_req = SearchRequest {
             query_vector: vector_data1.clone(), // Use Vec<f32> directly
@@ -218,10 +218,13 @@ async fn test_wal_recovery_with_checkpointing() {
         assert_eq!(index_guard.get_vector(&vector_id1).await.expect("v1 get failed before crash").expect("v1 not found before crash").0.to_vec(), vector_data1);
         assert_eq!(index_guard.get_vector(&vector_id2).await.expect("v2 get failed before crash").expect("v2 not found before crash").0.to_vec(), vector_data2);
         
-        let metadata_store_guard = app_state_guard.metadata_store.read().await;
-        let current_metadata = metadata_store_guard.get(&index_name).unwrap();
-        assert_eq!(current_metadata.get(&vector_id1).unwrap(), &metadata1.clone().unwrap());
-        assert_eq!(current_metadata.get(&vector_id2).unwrap(), &metadata2.clone().unwrap());
+        // Verify metadata using PayloadIndexRocksDB before "crash"
+        let payload_indices_guard = app_state_guard.payload_indices.read().await;
+        let payload_db = payload_indices_guard.get(&index_name).expect("Payload DB not found for index before crash");
+        let retrieved_payload1_before_crash = payload_db.get_payload(&vector_id1).expect("Failed to get payload1 from RocksDB before crash").expect("Payload1 not found in RocksDB before crash");
+        assert_eq!(retrieved_payload1_before_crash, metadata1.clone().unwrap());
+        let retrieved_payload2_before_crash = payload_db.get_payload(&vector_id2).expect("Failed to get payload2 from RocksDB before crash").expect("Payload2 not found in RocksDB before crash");
+        assert_eq!(retrieved_payload2_before_crash, metadata2.clone().unwrap());
 
 
     } // AppState dropped, simulating crash
@@ -251,10 +254,15 @@ async fn test_wal_recovery_with_checkpointing() {
         assert!(vec2_restarted_res.is_ok() && vec2_restarted_res.as_ref().unwrap().is_some(), "Vector2 (after_cp) should be present after recovery");
         assert_eq!(vec2_restarted_res.unwrap().unwrap().0.to_vec(), vector_data2, "Vector2 data mismatch");
         
-        let metadata_store_restarted_guard = app_state_restarted_guard.metadata_store.read().await;
-        let recovered_metadata_store = metadata_store_restarted_guard.get(&index_name).unwrap();
-        assert_eq!(recovered_metadata_store.get(&vector_id1).unwrap(), &metadata1.clone().unwrap(), "Metadata1 mismatch");
-        assert_eq!(recovered_metadata_store.get(&vector_id2).unwrap(), &metadata2.clone().unwrap(), "Metadata2 mismatch");
+        // Verify metadata using PayloadIndexRocksDB after restart
+        let payload_indices_restarted_guard = app_state_restarted_guard.payload_indices.read().await;
+        let payload_db_restarted = payload_indices_restarted_guard.get(&index_name).expect("Payload DB not found for index after restart");
+        
+        let retrieved_payload1_restarted = payload_db_restarted.get_payload(&vector_id1).expect("Failed to get payload1 from RocksDB after restart").expect("Payload1 not found in RocksDB after restart");
+        assert_eq!(retrieved_payload1_restarted, metadata1.clone().unwrap(), "Metadata1 mismatch after restart");
+        
+        let retrieved_payload2_restarted = payload_db_restarted.get_payload(&vector_id2).expect("Failed to get payload2 from RocksDB after restart").expect("Payload2 not found in RocksDB after restart");
+        assert_eq!(retrieved_payload2_restarted, metadata2.clone().unwrap(), "Metadata2 mismatch after restart");
 
         // Search for both vectors
         let search_resp1_json = crate::handlers::search_vectors(

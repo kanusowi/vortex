@@ -69,6 +69,11 @@ pub trait Segment: Send + Sync {
     /// Returns the path of the segment.
     fn path(&self) -> &Path;
 
+    /// Lists vectors in the segment, optionally limiting the count.
+    /// Returns a vector of (ID, Embedding) tuples.
+    /// Note: The order is not guaranteed.
+    async fn list_vectors(&self, limit: Option<usize>) -> Result<Vec<(VectorId, Embedding)>, VortexError>;
+
     // TODO: Add other necessary methods, e.g., for stats, configuration, specific HNSW operations if needed.
 }
 
@@ -220,9 +225,25 @@ impl SimpleSegment {
 
     /// Internal HNSW insertion logic.
     fn hnsw_insert_vector(&mut self, internal_id: u64, vector: &Embedding) -> Result<(), VortexError> {
-        let new_node_level_usize = generate_random_level(self.config.ml, &mut self.rng);
+        let mut new_node_level_usize = generate_random_level(self.config.ml, &mut self.rng);
+        
+        // Cap the generated level to be less than the graph's max layer capacity.
+        // max_layers_capacity is the number of layers (e.g., 3 means layers 0, 1, 2).
+        // So, max valid level index is max_layers_capacity - 1.
+        let max_cap = self.mmap_hnsw_graph_links.get_max_layers_capacity();
+        if max_cap > 0 { // Ensure max_cap is not 0 to prevent underflow
+            if new_node_level_usize >= max_cap as usize {
+                new_node_level_usize = (max_cap - 1) as usize;
+                trace!(%internal_id, capped_level = new_node_level_usize, "Capped generated level to fit graph capacity.");
+            }
+        } else {
+            // This case (max_cap == 0) should ideally not happen if graph is initialized with at least 1 layer.
+            new_node_level_usize = 0;
+            warn!(%internal_id, "Graph max_layers_capacity is 0. Setting new_node_level to 0.");
+        }
+
         let new_node_level: u16 = new_node_level_usize as u16;
-        trace!(%internal_id, new_node_level, "Generated level for new node.");
+        trace!(%internal_id, new_node_level, "Final level for new node.");
 
         let current_graph_entry_point_id = self.mmap_hnsw_graph_links.get_entry_point_node_id();
         debug!(%internal_id, current_graph_entry_point_id, "In hnsw_insert_vector, got entry point");
@@ -512,6 +533,34 @@ impl Segment for SimpleSegment {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    async fn list_vectors(&self, limit: Option<usize>) -> Result<Vec<(VectorId, Embedding)>, VortexError> {
+        let mut results = Vec::new();
+        let mut count = 0;
+        let limit_val = limit.unwrap_or(usize::MAX);
+
+        // Iterate over internal IDs stored in reverse_vector_map to ensure we only list valid, known vectors.
+        for (internal_id, vector_id) in &self.reverse_vector_map {
+            if count >= limit_val {
+                break;
+            }
+            // Check if the vector is marked as deleted in mmap_vector_storage
+            if !self.mmap_vector_storage.is_deleted(*internal_id) {
+                match self.mmap_vector_storage.get_vector(*internal_id) {
+                    Some(embedding) => {
+                        results.push((vector_id.clone(), embedding));
+                        count += 1;
+                    }
+                    None => {
+                        // This case should ideally not happen if reverse_vector_map is consistent
+                        // and non-deleted vectors are always present in mmap_vector_storage.
+                        warn!("Vector ID {} (internal {}) found in reverse_vector_map but not in mmap_vector_storage or marked deleted inconsistently.", vector_id, internal_id);
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
 }
 
 // TODO: Add unit tests for SimpleSegment
@@ -528,9 +577,10 @@ impl Segment for SimpleSegment {
 mod tests {
     use super::*;
     use crate::config::HnswConfig;
-    use crate::distance::DistanceMetric;
+    use crate::distance::{DistanceMetric, Distance}; // Import the Distance trait
     use crate::vector::Embedding;
     use tempfile::tempdir;
+    use ndarray::ArrayView1; // Needed for metric.distance calls
 
     fn create_test_segment_config() -> HnswConfig {
         // Using a config that matches HnswIndex tests for consistency
@@ -619,30 +669,73 @@ mod tests {
     }
     
     #[tokio::test]
-    async fn test_simple_segment_search_placeholder() {
+    async fn test_simple_segment_search_placeholder() { // Rename to test_simple_segment_search_hnsw
         let dir = tempdir().unwrap();
-        let segment_path = dir.path().join("segment_search");
+        let segment_path = dir.path().join("segment_search_hnsw"); // New path for clarity
         let mut config = create_test_segment_config();
         config.vector_dim = 2; // for 2D vectors
+        config.ef_search = 10; // Use a reasonable ef_search for testing
+        config.seed = Some(42); // Fixed seed for reproducible random levels
         let metric = DistanceMetric::L2;
         let mut segment = SimpleSegment::new(segment_path, config, metric).await.unwrap();
 
+        // Insert more vectors to make search more meaningful
         segment.insert_vector("v1".to_string(), Embedding::from(vec![1.0, 1.0])).await.unwrap();
-        segment.insert_vector("v2".to_string(), Embedding::from(vec![2.0, 2.0])).await.unwrap();
-        segment.insert_vector("v3".to_string(), Embedding::from(vec![10.0, 10.0])).await.unwrap();
+        segment.insert_vector("v2".to_string(), Embedding::from(vec![1.5, 1.5])).await.unwrap();
+        segment.insert_vector("v3".to_string(), Embedding::from(vec![2.0, 2.0])).await.unwrap();
+        segment.insert_vector("v4".to_string(), Embedding::from(vec![10.0, 10.0])).await.unwrap();
+        segment.insert_vector("v5".to_string(), Embedding::from(vec![0.5, 0.5])).await.unwrap();
+        segment.insert_vector("v6".to_string(), Embedding::from(vec![1.2, 1.2])).await.unwrap();
+
 
         let query = Embedding::from(vec![1.1, 1.1]);
-        let results = segment.search(&query, 2, config.ef_search).await.unwrap();
+        let k = 3;
+        let results = segment.search(&query, k, config.ef_search).await.unwrap();
         
-        // Current search is a placeholder (linear scan).
-        // With HNSW logic moved, this test will become more meaningful.
-        assert_eq!(results.len(), 2);
-        if !results.is_empty() {
-            assert_eq!(results[0].id, "v1"); // v1 should be closest
+        assert_eq!(results.len(), k, "Search should return k results");
+
+        // Expected order: v1 (dist approx 0.02), v6 (dist approx 0.02), v2 (dist approx 0.32), v5 (dist approx 0.72)
+        // Distances for L2:
+        // q = [1.1, 1.1]
+        // v1 = [1.0, 1.0] => (0.1)^2 + (0.1)^2 = 0.01 + 0.01 = 0.02. sqrt(0.02) = 0.1414
+        // v6 = [1.2, 1.2] => (-0.1)^2 + (-0.1)^2 = 0.01 + 0.01 = 0.02. sqrt(0.02) = 0.1414
+        // v2 = [1.5, 1.5] => (-0.4)^2 + (-0.4)^2 = 0.16 + 0.16 = 0.32. sqrt(0.32) = 0.5656
+        // v5 = [0.5, 0.5] => (0.6)^2 + (0.6)^2 = 0.36 + 0.36 = 0.72. sqrt(0.72) = 0.8485
+        
+        // HNSW is approximate, so exact order of equidistant points might vary,
+        // but v1 and v6 should be among the top.
+        // And their distances should be very close.
+        
+        let result_ids: Vec<String> = results.iter().map(|sr| sr.id.clone()).collect();
+
+        // Check if the closest vectors are present (order might vary slightly for equidistant)
+        assert!(result_ids.contains(&"v1".to_string()));
+        assert!(result_ids.contains(&"v6".to_string()));
+
+        // Check distances are plausible and sorted (ascending for L2)
+        for i in 0..results.len() - 1 {
+            assert!(results[i].distance <= results[i+1].distance, "Results should be sorted by distance");
         }
-        if results.len() > 1 {
-            assert_eq!(results[1].id, "v2"); // v2 should be next
+        
+        // Check specific distances for known closest points (approximate due to f32)
+        let dist_v1 = metric.distance(query.view(), ArrayView1::from(&[1.0, 1.0])).unwrap();
+        let dist_v6 = metric.distance(query.view(), ArrayView1::from(&[1.2, 1.2])).unwrap();
+
+        if let Some(r_v1) = results.iter().find(|r| r.id == "v1") {
+            assert!((r_v1.distance - dist_v1).abs() < 1e-5, "Distance for v1 is incorrect");
         }
+        if let Some(r_v6) = results.iter().find(|r| r.id == "v6") {
+            assert!((r_v6.distance - dist_v6).abs() < 1e-5, "Distance for v6 is incorrect");
+        }
+        
+        // Ensure v4 (far away) is not in top k
+        assert!(!result_ids.contains(&"v4".to_string()), "v4 should not be in the top k results");
+
+        // Test with k=1
+        let results_k1 = segment.search(&query, 1, config.ef_search).await.unwrap();
+        assert_eq!(results_k1.len(), 1);
+        // Either v1 or v6 should be the top result
+        assert!(results_k1[0].id == "v1" || results_k1[0].id == "v6");
     }
     
     // Test for vector_count reflecting non-deleted items
@@ -671,5 +764,178 @@ mod tests {
         
         segment.delete_vector(&"id3".to_string()).await.unwrap();
         assert_eq!(segment.vector_count(), 0, "Count after all deletes");
+    }
+
+    #[tokio::test]
+    async fn test_list_vectors_empty() {
+        let dir = tempdir().unwrap();
+        let segment_path = dir.path().join("segment_list_empty");
+        let config = create_test_segment_config();
+        let segment = SimpleSegment::new(segment_path, config, DistanceMetric::L2).await.unwrap();
+
+        let listed_vectors = segment.list_vectors(None).await.unwrap();
+        assert!(listed_vectors.is_empty(), "list_vectors on empty segment should return empty list");
+
+        let listed_vectors_limit = segment.list_vectors(Some(5)).await.unwrap();
+        assert!(listed_vectors_limit.is_empty(), "list_vectors with limit on empty segment should return empty list");
+    }
+
+    #[tokio::test]
+    async fn test_list_vectors_basic_and_with_limit() {
+        let dir = tempdir().unwrap();
+        let segment_path = dir.path().join("segment_list_basic");
+        let config = create_test_segment_config();
+        let mut segment = SimpleSegment::new(segment_path, config, DistanceMetric::L2).await.unwrap();
+
+        let vec1 = ("id1".to_string(), Embedding::from(vec![1.0, 0.0, 0.0]));
+        let vec2 = ("id2".to_string(), Embedding::from(vec![2.0, 0.0, 0.0]));
+        let vec3 = ("id3".to_string(), Embedding::from(vec![3.0, 0.0, 0.0]));
+
+        segment.insert_vector(vec1.0.clone(), vec1.1.clone()).await.unwrap();
+        segment.insert_vector(vec2.0.clone(), vec2.1.clone()).await.unwrap();
+        segment.insert_vector(vec3.0.clone(), vec3.1.clone()).await.unwrap();
+
+        // Test list_vectors with no limit
+        let listed_all = segment.list_vectors(None).await.unwrap();
+        assert_eq!(listed_all.len(), 3, "Should list all 3 vectors");
+        // Check if all inserted vectors are present (order not guaranteed)
+        assert!(listed_all.iter().any(|(id, _)| id == &vec1.0));
+        assert!(listed_all.iter().any(|(id, _)| id == &vec2.0));
+        assert!(listed_all.iter().any(|(id, _)| id == &vec3.0));
+
+        // Test list_vectors with limit smaller than total
+        let listed_limit_2 = segment.list_vectors(Some(2)).await.unwrap();
+        assert_eq!(listed_limit_2.len(), 2, "Should list 2 vectors with limit 2");
+
+        // Test list_vectors with limit equal to total
+        let listed_limit_3 = segment.list_vectors(Some(3)).await.unwrap();
+        assert_eq!(listed_limit_3.len(), 3, "Should list 3 vectors with limit 3");
+        
+        // Test list_vectors with limit larger than total
+        let listed_limit_5 = segment.list_vectors(Some(5)).await.unwrap();
+        assert_eq!(listed_limit_5.len(), 3, "Should list all 3 vectors with limit 5");
+    }
+
+    #[tokio::test]
+    async fn test_list_vectors_after_delete() {
+        let dir = tempdir().unwrap();
+        let segment_path = dir.path().join("segment_list_delete");
+        let config = create_test_segment_config();
+        let mut segment = SimpleSegment::new(segment_path, config, DistanceMetric::L2).await.unwrap();
+
+        let vec1_id = "id1".to_string();
+        let vec1_emb = Embedding::from(vec![1.0, 0.0, 0.0]);
+        segment.insert_vector(vec1_id.clone(), vec1_emb.clone()).await.unwrap();
+        segment.insert_vector("id2".to_string(), Embedding::from(vec![2.0, 0.0, 0.0])).await.unwrap();
+        
+        segment.delete_vector(&"id2".to_string()).await.unwrap();
+
+        let listed_vectors = segment.list_vectors(None).await.unwrap();
+        assert_eq!(listed_vectors.len(), 1, "Should list 1 vector after deletion");
+        assert_eq!(listed_vectors[0].0, vec1_id, "The remaining vector should be id1");
+        assert_eq!(listed_vectors[0].1, vec1_emb, "The embedding of remaining vector should be vec1_emb");
+    }
+
+    #[tokio::test]
+    async fn test_save_load_with_data() {
+        let dir = tempdir().unwrap();
+        let segment_path = dir.path().join("segment_save_load_data");
+        let mut config = create_test_segment_config();
+        config.vector_dim = 2;
+        let metric = DistanceMetric::Cosine; // Use a different metric for variety
+
+        let vec1_id = "v10".to_string();
+        let vec1_emb = Embedding::from(vec![0.1, 0.2]);
+        let vec2_id = "v20".to_string();
+        let vec2_emb = Embedding::from(vec![0.3, 0.4]);
+        let vec3_id = "v30".to_string();
+        let vec3_emb = Embedding::from(vec![0.5, 0.6]);
+
+        // Create, insert data, and save
+        {
+            let mut segment = SimpleSegment::new(segment_path.clone(), config, metric).await.unwrap();
+            segment.insert_vector(vec1_id.clone(), vec1_emb.clone()).await.unwrap();
+            segment.insert_vector(vec2_id.clone(), vec2_emb.clone()).await.unwrap();
+            segment.insert_vector(vec3_id.clone(), vec3_emb.clone()).await.unwrap();
+            
+            // Perform a search to ensure HNSW graph is built/modified
+            let _ = segment.search(&Embedding::from(vec![0.15, 0.25]), 1, config.ef_search).await.unwrap();
+            
+            segment.save().await.unwrap();
+        }
+
+        // Load the segment
+        let loaded_segment = SimpleSegment::load(segment_path.clone()).await.unwrap();
+
+        // Verify properties
+        assert_eq!(loaded_segment.path(), segment_path.as_path());
+        assert_eq!(loaded_segment.dimensions(), config.vector_dim as usize);
+        assert_eq!(loaded_segment.vector_count(), 3);
+        assert_eq!(loaded_segment.config, config);
+        assert_eq!(loaded_segment.distance_metric, metric);
+
+        // Verify vector map contents (spot check)
+        assert!(loaded_segment.vector_map.contains_key(&vec1_id));
+        assert!(loaded_segment.reverse_vector_map.values().any(|v_id| v_id == &vec2_id));
+        
+        // Verify retrieved vectors
+        assert_eq!(loaded_segment.get_vector(&vec1_id).await.unwrap().unwrap(), vec1_emb);
+        assert_eq!(loaded_segment.get_vector(&vec2_id).await.unwrap().unwrap(), vec2_emb);
+        assert_eq!(loaded_segment.get_vector(&vec3_id).await.unwrap().unwrap(), vec3_emb);
+
+        // Verify search results (consistency of HNSW graph state)
+        let query_emb = Embedding::from(vec![0.15, 0.25]);
+        let search_results_loaded = loaded_segment.search(&query_emb, 2, config.ef_search).await.unwrap();
+        assert_eq!(search_results_loaded.len(), 2);
+        // Further checks on search_results_loaded could compare against expected results if known,
+        // or against results from the original segment instance if stored.
+        // For now, just checking count and that it runs without error is a good sign.
+        // Example: one of the results should be v10 or v20 as they are closer to query_emb
+        let result_ids_loaded: Vec<String> = search_results_loaded.iter().map(|sr| sr.id.clone()).collect();
+        assert!(result_ids_loaded.contains(&vec1_id) || result_ids_loaded.contains(&vec2_id));
+    }
+    
+    #[tokio::test]
+    async fn test_insert_vector_incorrect_dimension() {
+        let dir = tempdir().unwrap();
+        let segment_path = dir.path().join("segment_incorrect_dim");
+        let mut config = create_test_segment_config();
+        config.vector_dim = 3;
+        let mut segment = SimpleSegment::new(segment_path, config, DistanceMetric::L2).await.unwrap();
+
+        let emb_wrong_dim = Embedding::from(vec![1.0, 2.0]); // Dimension 2
+        let result = segment.insert_vector("wrong_dim_vec".to_string(), emb_wrong_dim).await;
+        assert!(matches!(result, Err(VortexError::Configuration(_))));
+    }
+
+    #[tokio::test]
+    async fn test_search_edge_cases() {
+        let dir = tempdir().unwrap();
+        let segment_path = dir.path().join("segment_search_edges");
+        let mut config = create_test_segment_config();
+        config.vector_dim = 2;
+        let mut segment = SimpleSegment::new(segment_path.clone(), config, DistanceMetric::L2).await.unwrap();
+
+        // Search on empty segment
+        let query_empty = Embedding::from(vec![0.0, 0.0]);
+        let results_empty = segment.search(&query_empty, 3, config.ef_search).await.unwrap();
+        assert!(results_empty.is_empty(), "Search on empty segment should yield no results");
+
+        // Insert one vector
+        segment.insert_vector("v1".to_string(), Embedding::from(vec![1.0, 1.0])).await.unwrap();
+
+        // Search with k=0
+        let results_k0 = segment.search(&query_empty, 0, config.ef_search).await.unwrap();
+        assert!(results_k0.is_empty(), "Search with k=0 should yield no results");
+        
+        // Search with query of incorrect dimension
+        let query_wrong_dim = Embedding::from(vec![0.0, 0.0, 0.0]); // Dimension 3
+        let results_wrong_dim = segment.search(&query_wrong_dim, 1, config.ef_search).await;
+        assert!(matches!(results_wrong_dim, Err(VortexError::Configuration(_))));
+        
+        // Delete all vectors and search
+        segment.delete_vector(&"v1".to_string()).await.unwrap();
+        let results_after_all_deleted = segment.search(&query_empty, 1, config.ef_search).await.unwrap();
+        assert!(results_after_all_deleted.is_empty(), "Search after all vectors deleted should yield no results");
     }
 }

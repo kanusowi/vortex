@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use vortex_core::{HnswIndex, VectorId};
 use serde_json::Value;
-use crate::wal::wal_manager::CollectionWalManager; // Corrected path
+use crate::wal::wal_manager::CollectionWalManager;
+use crate::payload_index::PayloadIndexRocksDB; // This should be correct as per lib.rs
 
 /// Holds the shared state accessible by all request handlers.
 ///
@@ -24,6 +25,8 @@ pub struct AppState {
     pub metadata_store: Arc<RwLock<HashMap<String, HashMap<VectorId, Value>>>>,
     // Stores WAL managers for each index
     pub wal_managers: Arc<RwLock<HashMap<String, Arc<CollectionWalManager>>>>,
+    // Stores PayloadIndexRocksDB instances for each index
+    pub payload_indices: Arc<RwLock<HashMap<String, Arc<PayloadIndexRocksDB>>>>,
 }
 
 impl AppState {
@@ -34,6 +37,7 @@ impl AppState {
             indices: Arc::new(RwLock::new(HashMap::new())),
             metadata_store: Arc::new(RwLock::new(HashMap::new())),
             wal_managers: Arc::new(RwLock::new(HashMap::new())),
+            payload_indices: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
