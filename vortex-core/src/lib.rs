@@ -3,6 +3,7 @@ pub mod distance;
 pub mod error;
 pub mod hnsw;
 pub mod index;
+pub mod storage;
 pub mod vector;
 pub mod utils; // Make utils public for benchmarks/tests
 

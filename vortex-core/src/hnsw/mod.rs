@@ -1,25 +1,26 @@
 pub mod node; // Declare the node module
-pub use node::{Node, ArcNode};
+// pub use node::{Node, ArcNode}; // Node and ArcNode are removed
 pub mod builder; // Keep builder internal details separate if needed
 
-// Removed unused imports: Distance, Embedding, HnswConfig
 use crate::distance::DistanceMetric;
 use crate::error::{VortexError, VortexResult};
 use crate::distance::calculate_distance;
+use crate::storage::mmap_vector_storage::MmapVectorStorage; // Corrected path
+use crate::storage::mmap_hnsw_graph_links::MmapHnswGraphLinks; // Corrected path
 
-// Removed unused imports: HashMap, Arc
 use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
 use ndarray::ArrayView1;
 
 // --- Data Structures for Search ---
+// Duplicate import blocks removed.
 
 /// Represents an item in the priority queue used during search.
 /// Stores (distance, node_index). Ordered by distance.
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub(crate) struct Neighbor {
-    pub distance: f32,
-    pub index: usize,
+    pub distance: f32, // This is the heap_score (e.g., -L2_distance or Cosine_similarity)
+    pub internal_id: u64, // Changed from usize to u64
 }
 
 // Implement Eq and Ord for Neighbor to use it in BinaryHeap
@@ -95,96 +96,87 @@ pub(crate) fn original_score(metric: DistanceMetric, heap_score: f32) -> f32 { /
 /// Implements the SEARCH-LAYER algorithm from the HNSW paper.
 /// Returns a Max-Heap ordered by "best" score (highest similarity or lowest distance).
 pub(crate) fn search_layer(
-    query: ArrayView1<f32>,
-    entry_point_index: usize,
-    ef: usize, // Number of candidates to track (ef_search)
-    layer_level: usize,
-    nodes: &[ArcNode],
+    query_vector: ArrayView1<f32>,
+    entry_point_id: u64, // Changed from usize
+    ef: usize, // Number of candidates to track (ef_search or ef_construction)
+    layer_idx: u16, // Changed from u32 to u16 for consistency
+    vector_storage: &MmapVectorStorage,
+    graph_links: &MmapHnswGraphLinks,
     distance_metric: DistanceMetric,
-) -> VortexResult<BinaryHeap<Neighbor>> {
+) -> VortexResult<BinaryHeap<Neighbor>> { // Neighbor.index is now internal_id (u64)
 
-    let mut visited: HashSet<usize> = HashSet::new();
-    // Removed unused variable `candidates` based on compiler warning.
-    // Visited Queue: Min-heap based on distance/similarity for exploration order. `pop` gives next best to explore.
-    // Let's rename `candidates` to `results` and use a separate exploration queue.
+    let mut visited_ids: HashSet<u64> = HashSet::new();
+    let mut results_heap: BinaryHeap<Neighbor> = BinaryHeap::new(); // Max-Heap (best score on top)
+    let mut explore_queue: BinaryHeap<Neighbor> = BinaryHeap::new(); // Max-Heap (best score on top)
 
-    // `results`: Max-Heap storing the best `ef` neighbors found. `peek()` gives the worst neighbor in the set.
-    let mut results: BinaryHeap<Neighbor> = BinaryHeap::new();
-    // `explore_queue`: Max-Heap used to prioritize which node to visit next (best nodes first). `pop()` gives the best candidate to explore.
-    let mut explore_queue: BinaryHeap<Neighbor> = BinaryHeap::new();
-
-    // Calculate distance from entry point
-    let entry_node = &nodes[entry_point_index];
-    if entry_node.deleted {
-         return Err(VortexError::Internal("Search entry point is marked as deleted.".to_string()));
+    // Check if entry point is valid and not deleted
+    if vector_storage.is_deleted(entry_point_id) { // Removed ?
+        return Err(VortexError::Internal(format!(
+            "search_layer called with a deleted entry point ID: {}. Layer: {}", entry_point_id, layer_idx
+        )));
     }
-    let dist = calculate_distance(distance_metric, query, entry_node.vector.view())?;
+    
+    let entry_vector_opt = vector_storage.get_vector(entry_point_id); // Removed ?
+    let entry_vector = entry_vector_opt.ok_or_else(|| VortexError::Internal(format!(
+        "Entry point ID {} not found in vector storage for layer {}.", entry_point_id, layer_idx
+    )))?;
+
+    let dist = calculate_distance(distance_metric, query_vector, entry_vector.view())?;
     let score = heap_score(distance_metric, dist);
 
-    visited.insert(entry_point_index);
-    let initial_neighbor = Neighbor { distance: score, index: entry_point_index };
-    results.push(initial_neighbor);
+    visited_ids.insert(entry_point_id);
+    let initial_neighbor = Neighbor { distance: score, internal_id: entry_point_id };
+    results_heap.push(initial_neighbor);
     explore_queue.push(initial_neighbor);
 
-    while let Some(current_best) = explore_queue.pop() { // Get the best candidate to explore
+    // --- Main search loop ---
+    while let Some(current_best_to_explore) = explore_queue.pop() {
+        let worst_score_in_results = results_heap.peek().map_or(f32::NEG_INFINITY, |n| n.distance);
 
-        // Get the worst neighbor currently in the result set
-        let worst_in_results_score = results.peek().map_or(f32::NEG_INFINITY, |n| n.distance);
-
-        // If the current candidate is worse than the worst in the result set,
-        // and the result set is already full (ef size), we can stop exploring this path.
-        // (Higher score is better in our heap representation)
-        if current_best.distance < worst_in_results_score && results.len() >= ef {
-             // This condition seems reversed. If current_best is worse (lower score) than the worst in results, stop.
-            // break; // Optimization: Stop exploring if candidate is worse than the worst in results
-            // Let's trace the logic carefully.
-            // Example L2: score = -dist. worst_in_results_score = largest negative distance = smallest distance.
-            // current_best.score = -current_dist.
-            // If -current_dist < -smallest_dist => current_dist > smallest_dist. Yes, stop if current is farther than the farthest stored.
-            // Example Cosine: score = sim. worst_in_results_score = smallest similarity.
-            // current_best.score = current_sim.
-            // If current_sim < smallest_sim. Yes, stop if current is less similar than the least similar stored.
-             break; // Condition seems correct.
+        // Optimization: if current_best_to_explore is already worse than the worst in results_heap (and results_heap is full)
+        // (Higher score is better in our heap representation: -L2 distance or Cosine similarity)
+        if current_best_to_explore.distance < worst_score_in_results && results_heap.len() >= ef {
+            break; 
         }
 
-        let candidate_node = &nodes[current_best.index];
+        // Get connections for the current_best_to_explore.internal_id at layer_idx
+        let neighbor_connection_ids_slice = graph_links.get_connections(current_best_to_explore.internal_id, layer_idx)
+            .ok_or_else(|| VortexError::Internal(format!(
+                "Failed to get connections for node {} at layer {}. Node might be out of bounds or layer invalid.",
+                current_best_to_explore.internal_id, layer_idx
+            )))?;
 
-        // Ensure the node has connections at this layer before iterating
-        if let Some(neighbors_lock) = candidate_node.connections.get(layer_level) {
-            // Acquire read lock to iterate over connections
-            let neighbors_indices = neighbors_lock.read();
-            for &neighbor_index in neighbors_indices.iter() { // Iterate over the locked Vec
-                if !visited.contains(&neighbor_index) {
-                    visited.insert(neighbor_index);
-                    let neighbor_node = &nodes[neighbor_index];
+        for &neighbor_id in neighbor_connection_ids_slice { // Iterate directly over the slice
+            if !visited_ids.contains(&neighbor_id) {
+                visited_ids.insert(neighbor_id);
 
-                    // Skip deleted nodes during search traversal
-                    if neighbor_node.deleted {
-                        continue;
-                    }
+                if vector_storage.is_deleted(neighbor_id) { // Removed ?
+                    continue; // Skip deleted nodes
+                }
 
-                    let neighbor_dist = calculate_distance(distance_metric, query, neighbor_node.vector.view())?;
-                    let neighbor_score = heap_score(distance_metric, neighbor_dist);
-                    let current_worst_score = results.peek().map_or(f32::NEG_INFINITY, |n| n.distance);
+                let neighbor_vector_opt = vector_storage.get_vector(neighbor_id); // Removed ?
+                let neighbor_vector = neighbor_vector_opt.ok_or_else(|| VortexError::Internal(format!(
+                    "Neighbor ID {} (from graph links) not found in vector storage for layer {}.", neighbor_id, layer_idx
+                )))?;
 
-                    // If neighbor is better than the worst in the result set OR result set is not full
-                    if neighbor_score > current_worst_score || results.len() < ef {
-                        let new_neighbor = Neighbor { distance: neighbor_score, index: neighbor_index };
-                        results.push(new_neighbor);
-                        explore_queue.push(new_neighbor); // Add to exploration queue as well
+                let neighbor_dist = calculate_distance(distance_metric, query_vector, neighbor_vector.view())?;
+                let neighbor_heap_score = heap_score(distance_metric, neighbor_dist);
+                
+                let current_worst_score_in_results_heap = results_heap.peek().map_or(f32::NEG_INFINITY, |n| n.distance);
 
-                        // If result heap exceeds ef, remove the worst element
-                        if results.len() > ef {
-                            results.pop();
-                        }
+                if neighbor_heap_score > current_worst_score_in_results_heap || results_heap.len() < ef {
+                    let new_neighbor_candidate = Neighbor { distance: neighbor_heap_score, internal_id: neighbor_id };
+                    results_heap.push(new_neighbor_candidate);
+                    explore_queue.push(new_neighbor_candidate); // Add to exploration queue as well
+
+                    if results_heap.len() > ef {
+                        results_heap.pop(); // Remove the worst if heap exceeds ef
                     }
                 }
             }
         }
     }
-
-    // `results` is a Max-Heap containing the best `ef` neighbors (best score first when popped).
-    Ok(results)
+    Ok(results_heap)
 }
 
 
@@ -194,16 +186,11 @@ pub(crate) fn select_neighbors_heuristic(
     candidates: &BinaryHeap<Neighbor>, // Max-heap (best score first when popped)
     m: usize,
     // distance_metric: DistanceMetric, // Not needed if heap score is consistent
-) -> Vec<usize> {
-    // The heap `candidates` already contains the best neighbors found during search_layer,
-    // ordered by score (best first when popped). We just need to take the top M indices.
-    // BinaryHeap::into_sorted_vec sorts ascending. Since our score has 'best' as highest, we need to reverse.
-    // Removed unused variable `sorted_candidates` based on compiler warning.
-    // let sorted_candidates: Vec<_> = candidates.clone().into_sorted_vec(); // into_sorted_vec sorts ascending, need descending for best first.
+) -> Vec<u64> { // Returns Vec of internal_ids (u64)
     let mut best_first: Vec<_> = candidates.iter().cloned().collect();
     best_first.sort_by(|a, b| b.cmp(a)); // Sort descending by score (best first)
 
-    best_first.iter().map(|n| n.index).take(m).collect()
+    best_first.iter().map(|n| n.internal_id).take(m).collect()
 }
 
 

@@ -33,7 +33,7 @@ async fn main() {
     info!("Using persistence path: {:?}", persistence_path);
 
     // Create shared application state
-    let app_state = AppState::new();
+    let app_state = AppState::new(persistence_path.clone()); // Pass persistence_path to AppState::new
     info!("Application state created.");
 
     // Load indices from disk

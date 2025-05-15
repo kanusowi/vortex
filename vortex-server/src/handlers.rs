@@ -59,8 +59,21 @@ pub async fn create_index(
     }
 
     // Create the HNSW index instance
-    let new_index = HnswIndex::new(payload.config, payload.metric, payload.dimensions)
-        .map_err(ServerError::from)?; // Convert core error to server error
+    // TODO: Capacity should be configurable via CreateIndexRequest and server defaults.
+    const DEFAULT_CAPACITY: u64 = 1_000_000; // Example default capacity
+
+    let data_path_str = state.data_path.to_string_lossy().to_string(); // Get data_path from AppState
+    let base_path = std::path::Path::new(&data_path_str); // Convert to Path
+
+    let new_index = HnswIndex::new(
+        base_path,
+        &payload.name,
+        payload.config,
+        payload.metric,
+        payload.dimensions as u32, // Convert usize to u32
+        DEFAULT_CAPACITY
+    )
+    .map_err(ServerError::from)?; // Convert core error to server error
 
     // Store the index wrapped in Arc<RwLock<>> in the shared state
     indices_map.insert(payload.name.clone(), Arc::new(RwLock::new(new_index)));

@@ -55,7 +55,19 @@ impl IntoResponse for ServerError {
                     error!(error=%msg, "Core internal error");
                     (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
                 },
-                 VortexError::InvalidDistanceMetric => (StatusCode::BAD_REQUEST, "Invalid distance metric specified".to_string()),
+                VortexError::InvalidDistanceMetric => (StatusCode::BAD_REQUEST, "Invalid distance metric specified".to_string()),
+                VortexError::StorageError(msg) => {
+                    error!(error=%msg, "Core storage error");
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("Storage error: {}", msg))
+                },
+                VortexError::InvalidArgument(msg) => {
+                    error!(error=%msg, "Core invalid argument error");
+                    (StatusCode::BAD_REQUEST, format!("Invalid argument: {}", msg))
+                },
+                VortexError::StorageFull => {
+                    error!("Core storage full error");
+                    (StatusCode::INSUFFICIENT_STORAGE, "Storage is full".to_string())
+                },
             },
             ServerError::Internal(msg) => {
                 error!(error=%msg, "Internal server error");

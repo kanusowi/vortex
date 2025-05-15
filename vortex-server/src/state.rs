@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf; // Added PathBuf
 use std::sync::Arc;
 use tokio::sync::RwLock;
 // Using concrete HnswIndex type wrapped in RwLock for mutable access
@@ -12,6 +13,7 @@ use serde_json::Value;
 /// Also contains a separate store for vector metadata.
 #[derive(Clone, Debug)] // Add Debug
 pub struct AppState {
+    pub data_path: PathBuf, // Added data_path field
     // Arc allows multiple threads to own the RwLock safely.
     // RwLock allows multiple readers or one writer for the *HashMap*.
     // The value is Arc<RwLock<HnswIndex>> allowing shared ownership of the lock+index,
@@ -24,8 +26,9 @@ pub struct AppState {
 
 impl AppState {
     /// Creates a new instance of the application state.
-    pub fn new() -> Self {
+    pub fn new(data_path: PathBuf) -> Self {
         AppState {
+            data_path,
             indices: Arc::new(RwLock::new(HashMap::new())),
             metadata_store: Arc::new(RwLock::new(HashMap::new())),
         }

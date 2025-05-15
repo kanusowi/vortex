@@ -44,16 +44,40 @@ pub enum VortexError {
 
     #[error("Invalid distance metric specified")]
     InvalidDistanceMetric,
+
+    #[error("Storage error: {0}")]
+    StorageError(String),
+
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
+    #[error("Storage is full and cannot accept new data")]
+    StorageFull,
+}
+
+impl From<std::io::Error> for VortexError {
+    fn from(err: std::io::Error) -> Self {
+        // Create a generic path for cases where it's not readily available
+        // or to avoid making IoError variant too complex for simple conversions.
+        // Alternatively, one could create a new variant like `GenericIoError(String)`.
+        // For now, let's use a placeholder path.
+        VortexError::IoError {
+            path: PathBuf::from("<unknown_io_source>"),
+            source: err,
+        }
+    }
 }
 
 // Helper for converting bincode errors
-impl From<bincode::Error> for VortexError {
-    fn from(err: bincode::Error) -> Self {
-        // Box<bincode::ErrorKind> doesn't provide much detail in its Display impl
-        // Convert to string for a bit more context if possible.
-        VortexError::Serialization(format!("Bincode error: {}", err))
-    }
-}
+// Commented out as bincode is not a direct dependency for core persistence anymore.
+// If bincode is used for other serialization tasks, this can be reinstated.
+// impl From<bincode::Error> for VortexError {
+//     fn from(err: bincode::Error) -> Self {
+//         // Box<bincode::ErrorKind> doesn't provide much detail in its Display impl
+//         // Convert to string for a bit more context if possible.
+//         VortexError::Serialization(format!("Bincode error: {}", err))
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -132,20 +156,27 @@ mod tests {
     }
 
     #[test]
+    fn test_error_display_invalid_argument() {
+        let err = VortexError::InvalidArgument("Test invalid argument".to_string());
+        assert_eq!(format!("{}", err), "Invalid argument: Test invalid argument");
+    }
+
+    #[test]
     fn test_from_bincode_error() {
         // Create a dummy bincode::Error (this is a bit tricky as ErrorKind is non-exhaustive)
         // We'll simulate one by using a Deserialization error which bincode can produce.
-        let bincode_err_kind = bincode::ErrorKind::DeserializeAnyNotSupported;
-        let bincode_err = Box::new(bincode_err_kind);
+        // let bincode_err_kind = bincode::ErrorKind::DeserializeAnyNotSupported;
+        // let bincode_err = Box::new(bincode_err_kind);
         
-        let vortex_err: VortexError = bincode_err.into();
-        match vortex_err {
-            VortexError::Serialization(msg) => {
-                assert!(msg.contains("Bincode error"));
-                // Making the check more general as the exact message for DeserializeAnyNotSupported might vary.
-                // We've already confirmed it's a Bincode error.
-            }
-            _ => panic!("Expected VortexError::Serialization variant"),
-        }
+        // let vortex_err: VortexError = bincode_err.into();
+        // match vortex_err {
+        //     VortexError::Serialization(msg) => {
+        //         assert!(msg.contains("Bincode error"));
+        //         // Making the check more general as the exact message for DeserializeAnyNotSupported might vary.
+        //         // We've already confirmed it's a Bincode error.
+        //     }
+        //     _ => panic!("Expected VortexError::Serialization variant"),
+        // }
+        // Test commented out as From<bincode::Error> is commented out.
     }
 }

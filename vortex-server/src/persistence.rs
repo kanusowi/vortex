@@ -31,26 +31,34 @@ pub async fn save_index(index_name: &str, app_state: &AppState, persistence_path
     // 1. Save HNSW Index Data
     let hnsw_file_path = get_hnsw_file_path(persistence_path, index_name);
     {
-        let indices_map = app_state.indices.read().await;
+        let indices_map = app_state.indices.read().await; // Still need read lock on map to get the Arc
         if let Some(index_arc_lock) = indices_map.get(index_name) {
-            let index_guard = index_arc_lock.read().await; // Read lock for saving
-            debug!(file_path = ?hnsw_file_path, "Saving HNSW data for index");
-            let file = File::create(&hnsw_file_path)
-                .map_err(|e| VortexError::IoError { path: hnsw_file_path.clone(), source: e })?;
-            let mut writer = BufWriter::new(file);
-            index_guard.save(&mut writer).await
+            let mut index_guard = index_arc_lock.write().await; // Acquire write lock on the specific index
+            debug!(file_path = ?hnsw_file_path, "Saving HNSW data for index (this now includes metadata)");
+            // The HnswIndex::save method now handles its own file creation and metadata.
+            // The writer argument in the trait is becoming problematic for mmap.
+            // For now, we pass a dummy writer as the trait requires it.
+            // This part of the trait/impl might need a redesign if the writer is truly unused by mmap.
+            let mut dummy_writer = Vec::new(); // Dummy writer
+            index_guard.save(&mut dummy_writer).await
                 .map_err(|e| {
-                    error!(index_name, error = ?e, "Failed to save HNSW data");
+                    error!(index_name, error = ?e, "Failed to save HNSW data and metadata");
                     e // Return VortexError
                 })?;
-            info!(index_name, file_path = ?hnsw_file_path, "HNSW data saved successfully");
+            info!(index_name, file_path = ?hnsw_file_path, "HNSW data and metadata saved successfully via HnswIndex::save");
         } else {
-            warn!(index_name, "Index not found in memory, cannot save HNSW data.");
-            return Err(crate::error::ServerError::IndexNotFound(index_name.to_string())); // Or a specific persistence error
+            warn!(index_name, "Index not found in memory, cannot save.");
+            return Err(crate::error::ServerError::IndexNotFound(index_name.to_string()));
         }
     }
 
-    // 2. Save Metadata
+    // 2. Save Metadata (This section is now handled by HnswIndex::save directly)
+    // We can remove the separate metadata saving logic here if HnswIndex::save covers it.
+    // For now, let's assume HnswIndex::save handles the .hnsw_meta.json file.
+    // The old metadata logic for server-specific metadata (if any) might still be needed.
+    // The current server metadata is just a copy of vector metadata, which is not what HnswIndex::save persists.
+    // The server's metadata_store seems to be for payload, which is separate.
+    // Let's keep the payload metadata saving logic.
     let metadata_file_path = get_metadata_file_path(persistence_path, index_name);
     {
         let metadata_store_guard = app_state.metadata_store.read().await;
@@ -136,12 +144,22 @@ pub async fn load_all_indices_on_startup(app_state: &AppState, persistence_path:
                                 let index_name = file_stem.to_string();
                                 info!(index_name, file_path = ?path, "Found potential index file. Attempting to load.");
 
-                                // Load HNSW data
-                                match HnswIndex::load_from_path(&path) {
+                                // TODO: HnswConfig and DistanceMetric should be persisted and loaded per index.
+                                // Using defaults for now, which might not match the original index settings.
+                                // This needs to be addressed by saving config/metric, perhaps in the .hnsw_meta.json.
+                                let default_config = vortex_core::HnswConfig::default(); 
+                                let default_metric = vortex_core::DistanceMetric::Cosine; // Or another sensible default
+                                warn!(index_name, "Loading index with default HnswConfig and DistanceMetric as they are not yet persisted.");
+
+                                // Load HNSW data using HnswIndex::open
+                                // Note: HnswIndex::open expects base_path and name separately.
+                                // `path` here is persistence_path/index_name.vortex
+                                // `persistence_path` is the directory. `index_name` is the stem.
+                                match HnswIndex::open(persistence_path, &index_name, default_config, default_metric) {
                                     Ok(hnsw_index) => {
                                         indices_map_guard.insert(index_name.clone(), Arc::new(RwLock::new(hnsw_index)));
                                         
-                                        // Load corresponding metadata
+                                        // Load corresponding server-level payload metadata
                                         let metadata_file_path = get_metadata_file_path(persistence_path, &index_name);
                                         if metadata_file_path.exists() {
                                             match File::open(&metadata_file_path) {

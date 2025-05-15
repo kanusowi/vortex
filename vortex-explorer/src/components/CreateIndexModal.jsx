@@ -1,33 +1,44 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react'; // Added useState
 import { useForm, Controller } from 'react-hook-form';
 import { useDispatch, useSelector } from 'react-redux';
 import {
     Button, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle,
-    TextField, FormControl, InputLabel, Select, MenuItem, CircularProgress, Box, Alert, Typography // Added Typography
+    TextField, FormControl, InputLabel, Select, MenuItem, CircularProgress, Box, Alert, Typography,
+    Accordion, AccordionSummary, AccordionDetails, Tooltip, IconButton // Added Accordion components and Tooltip
 } from '@mui/material';
 import AddCircleOutlineIcon from '@mui/icons-material/AddCircleOutline';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'; // For Accordion
+import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined'; // For tooltips
 import toast from 'react-hot-toast';
 import { createIndex, selectCreateIndexStatus, selectCreateIndexError, resetCreateStatus } from '../features/indices/indicesSlice';
 
 const HNSW_DEFAULT_M = 16;
 const HNSW_DEFAULT_EF_CONSTRUCTION = 200;
+const HNSW_DEFAULT_EF_SEARCH = 50;
 
 function CreateIndexModal() {
     const dispatch = useDispatch();
-    const [open, setOpen] = React.useState(false);
+    const [open, setOpen] = useState(false); // Use useState from React
+    const [advancedOpen, setAdvancedOpen] = useState(false); // State for accordion
     const createStatus = useSelector(selectCreateIndexStatus);
     const createError = useSelector(selectCreateIndexError);
 
-    const { control, handleSubmit, formState: { errors }, reset } = useForm({
+    const { control, handleSubmit, formState: { errors }, reset, watch } = useForm({ // Added watch
         defaultValues: {
             indexName: '',
             dimensions: 128,
             metric: 'cosine',
-            // HNSW specific config (optional, could be hidden under "Advanced")
-            m: HNSW_DEFAULT_M, 
+            m: HNSW_DEFAULT_M,
             efConstruction: HNSW_DEFAULT_EF_CONSTRUCTION,
+            // Advanced fields
+            mMax0: '', // Default to empty, will derive from m if not set
+            efSearch: HNSW_DEFAULT_EF_SEARCH,
+            ml: '', // Default to empty, will derive from m if not set
+            seed: '', // Default to empty for null/None
         },
     });
+
+    const mValue = watch('m'); // Watch m value for dynamic defaults
 
     const handleClickOpen = () => {
         setOpen(true);
@@ -35,29 +46,32 @@ function CreateIndexModal() {
 
     const handleClose = () => {
         setOpen(false);
-        // Reset form and Redux status only if not currently creating
         if (createStatus !== 'creating') {
-            reset();
+            reset(); // Reset form to defaultValues
             dispatch(resetCreateStatus());
+            setAdvancedOpen(false); // Close accordion
         }
     };
 
     const onSubmit = (data) => {
-        // Construct the HnswConfig object with all required fields
-        // Use defaults from vortex-core/src/config.rs for fields not in the form
         const mVal = parseInt(data.m, 10);
         const efConstructionVal = parseInt(data.efConstruction, 10);
+
+        // Advanced fields parsing
+        const mMax0Val = data.mMax0 && data.mMax0.trim() !== '' ? parseInt(data.mMax0, 10) : mVal * 2;
+        const efSearchVal = data.efSearch && data.efSearch.toString().trim() !== '' ? parseInt(data.efSearch, 10) : HNSW_DEFAULT_EF_SEARCH;
+        const mlVal = data.ml && data.ml.trim() !== '' ? parseFloat(data.ml) : (1.0 / (mVal > 0 ? Math.log(mVal) : Math.log(HNSW_DEFAULT_M)));
+        const seedVal = data.seed && data.seed.trim() !== '' ? parseInt(data.seed, 10) : null;
         
         const hnswConfigPayload = {
             m: mVal,
-            m_max0: mVal * 2, // Default heuristic from HnswConfig::new
+            m_max0: mMax0Val,
             ef_construction: efConstructionVal,
-            ef_search: 50, // Default from HnswConfig::default()
-            ml: 1.0 / (mVal > 0 ? Math.log(mVal) : Math.log(16)), // Default heuristic, ensure mVal > 0 for log
-            seed: null, // Corresponds to Option<u64>::None
+            ef_search: efSearchVal,
+            ml: mlVal,
+            seed: seedVal,
         };
 
-        // Map frontend metric value to backend expected value
         let backendMetric = data.metric;
         if (data.metric === 'cosine') backendMetric = 'Cosine';
         if (data.metric === 'euclidean') backendMetric = 'L2';
@@ -134,26 +148,81 @@ function CreateIndexModal() {
                             {errors.metric && <Typography color="error" variant="caption" sx={{ml:1.5}}>{errors.metric.message}</Typography>}
                         </FormControl>
                         
-                        <Typography variant="caption" color="text.secondary" sx={{mt:1}}>HNSW Configuration (Optional):</Typography>
+                        <Typography variant="subtitle2" color="text.primary" sx={{mt: 2, mb: 1}}>Basic HNSW Configuration:</Typography>
                         <Controller
                             name="m"
                             control={control}
-                            rules={{ min: { value: 2, message: 'M must be at least 2' } }}
+                            rules={{ required: 'M is required', min: { value: 2, message: 'M must be at least 2' } }}
                             render={({ field }) => (
-                                <TextField {...field} label="M (Max Connections)" type="number" fullWidth error={!!errors.m} helperText={errors.m?.message} disabled={createStatus === 'creating'} InputProps={{ inputProps: { min: 2 } }} />
+                                <Tooltip title="Maximum number of connections per node on layers > 0. Higher values increase build time and memory but can improve recall.">
+                                    <TextField {...field} label="M (Max Connections)" type="number" fullWidth error={!!errors.m} helperText={errors.m?.message} disabled={createStatus === 'creating'} InputProps={{ inputProps: { min: 2 } }} />
+                                </Tooltip>
                             )}
                         />
                         <Controller
                             name="efConstruction"
                             control={control}
-                            rules={{ min: { value: 10, message: 'efConstruction must be at least 10' } }}
+                            rules={{ required: 'efConstruction is required', min: { value: 10, message: 'efConstruction must be at least 10' } }}
                             render={({ field }) => (
-                                <TextField {...field} label="efConstruction (Search Quality)" type="number" fullWidth error={!!errors.efConstruction} helperText={errors.efConstruction?.message} disabled={createStatus === 'creating'} InputProps={{ inputProps: { min: 10 } }} />
+                                <Tooltip title="Size of the dynamic candidate list during index construction. Higher values improve index quality/recall at the cost of slower build times.">
+                                    <TextField {...field} label="efConstruction (Build Quality)" type="number" fullWidth error={!!errors.efConstruction} helperText={errors.efConstruction?.message} disabled={createStatus === 'creating'} InputProps={{ inputProps: { min: 10 } }} />
+                                </Tooltip>
                             )}
                         />
+
+                        <Accordion expanded={advancedOpen} onChange={() => setAdvancedOpen(!advancedOpen)} sx={{ mt: 2, boxShadow: 'none', '&:before': { display: 'none' }, border: `1px solid ${errors.mMax0 || errors.efSearch || errors.ml || errors.seed ? 'red' : 'rgba(0, 0, 0, 0.23)'}`, borderRadius: 1 }}>
+                            <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                                <Typography>Advanced HNSW Configuration (Optional)</Typography>
+                            </AccordionSummary>
+                            <AccordionDetails sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt:0 }}>
+                                <Controller
+                                    name="mMax0"
+                                    control={control}
+                                    rules={{ 
+                                        validate: value => (value === '' || parseInt(value,10) >= (mValue || HNSW_DEFAULT_M)) || `Must be >= M (${mValue || HNSW_DEFAULT_M})`,
+                                        min: { value: 2, message: 'Must be at least 2 if set' }
+                                    }}
+                                    render={({ field }) => (
+                                        <Tooltip title={`Max connections for layer 0. Defaults to 2 * M (currently ${ (mValue || HNSW_DEFAULT_M) * 2}). Higher values can improve recall at layer 0.`}>
+                                            <TextField {...field} label="M_max0 (Layer 0 Max Connections)" placeholder={`Defaults to ${ (mValue || HNSW_DEFAULT_M) * 2}`} type="number" fullWidth error={!!errors.mMax0} helperText={errors.mMax0?.message} disabled={createStatus === 'creating'} InputProps={{ inputProps: { min: 2 } }} />
+                                        </Tooltip>
+                                    )}
+                                />
+                                <Controller
+                                    name="efSearch"
+                                    control={control}
+                                    rules={{ required: 'efSearch is required', min: { value: 1, message: 'efSearch must be at least 1' } }}
+                                    render={({ field }) => (
+                                        <Tooltip title="Size of the dynamic candidate list during search. Higher values improve search recall but increase search latency. Must be >= k (number of neighbors to find).">
+                                            <TextField {...field} label="efSearch (Search Quality/Speed)" type="number" fullWidth error={!!errors.efSearch} helperText={errors.efSearch?.message} disabled={createStatus === 'creating'} InputProps={{ inputProps: { min: 1 } }} />
+                                        </Tooltip>
+                                    )}
+                                />
+                                <Controller
+                                    name="ml"
+                                    control={control}
+                                    rules={{ validate: value => (value === '' || parseFloat(value) > 0) || 'Must be > 0 if set' }}
+                                    render={({ field }) => (
+                                        <Tooltip title={`Normalization factor for level generation. Defaults based on M (approx ${ (1.0 / Math.log(mValue || HNSW_DEFAULT_M)).toFixed(4) }). Affects the probability distribution of node levels.`}>
+                                            <TextField {...field} label="mL Factor (Level Generation)" placeholder={`Defaults based on M (approx ${ (1.0 / Math.log(mValue || HNSW_DEFAULT_M)).toFixed(4) })`} type="number" step="0.01" fullWidth error={!!errors.ml} helperText={errors.ml?.message} disabled={createStatus === 'creating'} InputProps={{ inputProps: { min: 0.0001 } }} />
+                                        </Tooltip>
+                                    )}
+                                />
+                                <Controller
+                                    name="seed"
+                                    control={control}
+                                    rules={{ validate: value => (value === '' || Number.isInteger(Number(value))) || 'Must be an integer if set' }}
+                                    render={({ field }) => (
+                                        <Tooltip title="Optional integer seed for the random number generator to ensure reproducible index builds. Leave empty for random seed.">
+                                            <TextField {...field} label="Seed (Optional, for Reproducibility)" placeholder="Leave empty for random" type="number" fullWidth error={!!errors.seed} helperText={errors.seed?.message} disabled={createStatus === 'creating'} />
+                                        </Tooltip>
+                                    )}
+                                />
+                            </AccordionDetails>
+                        </Accordion>
                     </Box>
                     {createStatus === 'failed' && createError && (
-                         <Alert severity="error" sx={{ mt: 2 }}>{createError}</Alert>
+                         <Alert severity="error" sx={{ mt: 2 }} variant="outlined">{createError}</Alert>
                     )}
                 </DialogContent>
                 <DialogActions sx={{ p: '16px 24px' }}>
