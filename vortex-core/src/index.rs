@@ -164,6 +164,11 @@ impl HnswIndex {
         Ok(new_index)
     }
 
+    /// Returns the number of segments in the index.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
     /// Opens an existing HNSW index, loading its segments.
     pub async fn open( // Changed to async fn
         base_path: &Path,
@@ -292,18 +297,9 @@ impl Index for HnswIndex {
         // A quick check against segment 0's map before write lock for efficiency
         // This is not robust for multi-segment scenario or concurrent global ID checks.
         // For now, let SimpleSegment handle its internal map.
-        // The `bool` return from `add_vector` is tricky. Let's assume it means "operation succeeded".
-        // If SimpleSegment::insert_vector handles updates, then this is fine.
-        // If it should error on duplicate, then this is also fine.
-        // The original HnswIndex returned Ok(false) if ID existed.
-        // Let's try to replicate that for segment 0.
-        if segment.get_vector(&id).await?.is_some() {
-             warn!(?id, "Attempted to add vector with existing ID in segment 0. Operation ignored.");
-             return Ok(false);
-        }
-
-        segment.insert_vector(id, vector).await?;
-        Ok(true)
+        // The `bool` return from `add_vector` indicates if it was a new insert (true) or an update (false).
+        // SimpleSegment::insert_vector now returns Result<bool, VortexError>.
+        segment.insert_vector(id, vector).await // Directly return the result from the segment
     }
 
     async fn search(&self, query: Embedding, k: usize) -> VortexResult<Vec<(VectorId, f32)>> {

@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package vortex.api.v1;
+
+import "src/proto/vortex/api/v1/common.proto";
+
+option go_package = "github.com/vortex-db/vortex/proto/vortex/api/v1;vortex_api_v1";
+option java_package = "io.vortexdb.api.v1";
+option java_multiple_files = true;
+option java_outer_classname = "CollectionsServiceProto";
+
+// Service for managing collections (indices).
+service CollectionsService {
+  // Creates a new collection.
+  rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
+
+  // Gets detailed information about a collection.
+  rpc GetCollectionInfo(GetCollectionInfoRequest) returns (GetCollectionInfoResponse);
+
+  // Lists all available collections.
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+
+  // Deletes a collection and all its data.
+  rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
+
+  // TODO: Add UpdateCollection (e.g., for HNSW params, optimizers) later.
+  // TODO: Add Aliasing operations later.
+}
+
+// Request to create a new collection.
+message CreateCollectionRequest {
+  string collection_name = 1;         // Name of the collection to create.
+  uint32 vector_dimensions = 2;       // Dimensionality of vectors in this collection.
+  DistanceMetric distance_metric = 3; // Distance metric to use.
+  optional HnswConfigParams hnsw_config = 4; // HNSW specific configuration.
+  // TODO: Add sharding_params, replication_params, quantization_config later.
+}
+
+// Response for CreateCollection.
+message CreateCollectionResponse {
+  // bool success = 1; // Or simply rely on gRPC status codes.
+  // optional string message = 2;
+  // For now, empty response indicates success if status is OK.
+}
+
+// Request to get information about a collection.
+message GetCollectionInfoRequest {
+  string collection_name = 1; // Name of the collection.
+}
+
+// Response for GetCollectionInfo.
+message GetCollectionInfoResponse {
+  string collection_name = 1;
+  CollectionStatus status = 2;          // Current status of the collection.
+  uint64 vector_count = 3;              // Number of vectors in the collection.
+  uint64 segment_count = 4;             // Number of segments (if applicable).
+  uint64 disk_size_bytes = 5;           // Estimated disk usage.
+  uint64 ram_footprint_bytes = 6;       // Estimated RAM usage.
+  HnswConfigParams config = 7;          // Current HNSW configuration.
+  DistanceMetric distance_metric = 8;   // Distance metric used.
+  // TODO: Add payload_schema_info, quantization_status later.
+}
+
+// Status of a collection.
+enum CollectionStatus {
+  COLLECTION_STATUS_UNSPECIFIED = 0;
+  GREEN = 1;    // All shards/replicas healthy.
+  YELLOW = 2;   // Some replicas unavailable, but data is accessible.
+  RED = 3;      // Some shards unavailable, data loss or complete unavailability.
+  OPTIMIZING = 4; // Collection is undergoing background optimization.
+  CREATING = 5;   // Collection is being created.
+}
+
+// Request to list all collections.
+message ListCollectionsRequest {
+  // No parameters for now, could add pagination later.
+}
+
+// Response for ListCollections.
+message ListCollectionsResponse {
+  repeated CollectionDescription collections = 1;
+}
+
+// Brief description of a collection for listing.
+message CollectionDescription {
+  string name = 1;
+  uint64 vector_count = 2;
+  CollectionStatus status = 3;
+  uint32 dimensions = 4;
+  DistanceMetric distance_metric = 5;
+}
+
+// Request to delete a collection.
+message DeleteCollectionRequest {
+  string collection_name = 1; // Name of the collection to delete.
+  // optional bool wait_for_completion = 2; // Default to true.
+}
+
+// Response for DeleteCollection.
+message DeleteCollectionResponse {
+  // Empty response indicates success if status is OK.
+}

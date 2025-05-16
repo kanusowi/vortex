@@ -278,6 +278,20 @@ pub async fn load_all_indices_on_startup(app_state: &AppState, persistence_path:
                                                                         // If we are recovering an existing index, this might be a no-op or for validation.
                                                                         debug!(%index_name, %lsn, "Skipping CreateIndex record during WAL replay for already opened index.");
                                                                     }
+                                                                    WalRecord::DeleteCollection { name } => {
+                                                                        // This implies the collection should be removed from memory and disk if it exists.
+                                                                        // However, HnswIndex::open might have already loaded it.
+                                                                        // This replay logic needs to be robust against re-applying deletions.
+                                                                        // For now, just log. A more robust implementation would ensure
+                                                                        // the collection is indeed removed from app_state and disk.
+                                                                        warn!(%index_name, %lsn, collection_to_delete = %name, "WAL Replay: Encountered DeleteCollection record. Ensure collection is removed if this replay is authoritative.");
+                                                                        // Potentially:
+                                                                        // indices_map_guard.remove(&name);
+                                                                        // metadata_store_guard.remove(&name);
+                                                                        // wal_managers_guard.remove(&name);
+                                                                        // payload_indices_guard.remove(&name);
+                                                                        // tokio::fs::remove_dir_all(persistence_path.join(name)).await; (would need async block)
+                                                                    }
                                                                 }
                                                             }
                                                             info!(%index_name, "WAL replay completed.");

@@ -13,9 +13,14 @@ use tracing_subscriber::EnvFilter;
 
 // Use modules from the vortex_server library
 use vortex_server::handlers;
- // Make the state module available for persistence::calls
-use vortex_server::state::AppState; // Make AppState type directly available for AppState::new
+use vortex_server::state::AppState;
 use vortex_server::persistence;
+use vortex_server::grpc_api::vortex_api_v1::{
+    collections_service_server::CollectionsServiceServer,
+    points_service_server::PointsServiceServer,
+};
+use vortex_server::grpc_services::{CollectionsServerImpl, PointsServerImpl};
+use tonic::transport::Server as TonicServer;
 // Note: The original `use state::AppState;` is now covered by `use vortex_server::state::AppState;`
 
 #[cfg(test)]
@@ -77,21 +82,46 @@ async fn main() {
         .layer(CorsLayer::permissive()) // Allow all origins (adjust for production)
         .with_state(app_state_clone_for_router); // Provide shared state to handlers
 
-    // Define server address
-    // TODO: Load from config file/env vars
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    info!("Starting server on {}", addr);
+    // Define REST server address
+    let rest_addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    info!("Starting REST server on {}", rest_addr);
 
-    // Run the server
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    // Removed duplicate info log: info!("Starting server on {}", addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(app_state_clone_for_shutdown, persistence_path_clone_for_shutdown))
+    // Define gRPC server address
+    let grpc_addr = SocketAddr::from(([127, 0, 0, 1], 50051));
+    info!("Starting gRPC server on {}", grpc_addr);
+
+    // Clone AppState for gRPC services
+    let app_state_for_grpc = app_state_arc.clone();
+
+    // Create gRPC service implementations
+    let collections_service = CollectionsServerImpl { app_state: app_state_for_grpc.clone() };
+    let points_service = PointsServerImpl { app_state: app_state_for_grpc };
+
+    // Spawn gRPC server in a separate Tokio task
+    let grpc_server_handle = tokio::spawn(async move {
+        TonicServer::builder()
+            .add_service(CollectionsServiceServer::new(collections_service))
+            .add_service(PointsServiceServer::new(points_service))
+            .serve(grpc_addr)
+            .await
+            .expect("Failed to start gRPC server");
+    });
+    info!("gRPC server task spawned.");
+
+    // Run the Axum REST server
+    let axum_listener = tokio::net::TcpListener::bind(rest_addr).await.unwrap();
+    info!("Axum REST server listening on {}", rest_addr);
+    axum::serve(axum_listener, app)
+        .with_graceful_shutdown(shutdown_signal(app_state_clone_for_shutdown, persistence_path_clone_for_shutdown, grpc_server_handle))
         .await
         .unwrap();
 }
 
-async fn shutdown_signal(app_state_arc: Arc<RwLock<AppState>>, persistence_path: PathBuf) {
+async fn shutdown_signal(
+    app_state_arc: Arc<RwLock<AppState>>, 
+    persistence_path: PathBuf,
+    grpc_server_handle: tokio::task::JoinHandle<()>, // Add JoinHandle for gRPC server
+) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -124,5 +154,14 @@ async fn shutdown_signal(app_state_arc: Arc<RwLock<AppState>>, persistence_path:
         let app_state_guard = app_state_arc.read().await;
         persistence::save_all_indices(&*app_state_guard, &persistence_path).await;
     }
-    info!("All indices saved. Shutting down.");
+    info!("All indices saved.");
+    
+    // Gracefully shutdown gRPC server (optional, as it's in a spawned task that will end with main)
+    // For a more controlled shutdown, you might use a channel to signal the gRPC server to stop.
+    // Here, we'll just log that we're proceeding to shutdown.
+    info!("Proceeding to shutdown gRPC server task...");
+    grpc_server_handle.abort(); // Abort the gRPC server task
+    info!("gRPC server task signaled for shutdown.");
+
+    info!("Vortex Server shutting down completely.");
 }

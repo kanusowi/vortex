@@ -31,11 +31,12 @@ pub(crate) struct SimpleSegmentMetadata { // Made pub(crate)
 #[async_trait]
 pub trait Segment: Send + Sync {
     /// Inserts a vector into the segment.
+    /// Returns Ok(true) if the vector was newly added, Ok(false) if an existing vector was updated.
     async fn insert_vector(
         &mut self,
         vector_id: VectorId,
         embedding: Embedding,
-    ) -> Result<(), VortexError>;
+    ) -> Result<bool, VortexError>;
 
     /// Deletes a vector from the segment.
     async fn delete_vector(&mut self, vector_id: &VectorId) -> Result<(), VortexError>;
@@ -418,11 +419,11 @@ impl SimpleSegment {
 
 #[async_trait]
 impl Segment for SimpleSegment {
-    async fn insert_vector(
+        async fn insert_vector(
         &mut self,
         vector_id: VectorId,
         embedding: Embedding,
-    ) -> Result<(), VortexError> {
+    ) -> Result<bool, VortexError> { // Changed return type
         if embedding.len() != self.config.vector_dim as usize {
             return Err(VortexError::Configuration(format!(
                 "Invalid vector dimension: expected {}, got {}",
@@ -431,34 +432,38 @@ impl Segment for SimpleSegment {
             )));
         }
 
-        // Check if vector_id already exists. If so, this is an update.
-        // HNSW update often means delete then insert. For simplicity, we might just update vector data
-        // and not change graph structure, or re-insert.
-        // For now, let's assume if ID exists, we update its vector and re-run HNSW logic for it.
-        // This is complex. A simpler approach for "update" is to delete then insert.
-        // Let's assume for now `insert_vector` is for new vectors.
-        // If vector_id exists, we could error or ignore. The trait doesn't specify.
-        // Let's make it an error to insert an existing ID for now.
-        if self.vector_map.contains_key(&vector_id) {
-            return Err(VortexError::StorageError(format!("Vector ID {} already exists in segment", vector_id)));
+        let mut is_new_insert = true;
+        let internal_id: u64;
+
+        if let Some(&existing_internal_id) = self.vector_map.get(&vector_id) {
+            // ID exists, this is an update.
+            is_new_insert = false;
+            internal_id = existing_internal_id;
+            debug!(?vector_id, %internal_id, "Updating existing vector in segment.");
+            // Mark old vector data as deleted. The HNSW graph links for this internal_id will be rebuilt.
+            // Note: A more robust HNSW update might involve removing the node from graph first.
+            // For now, overwriting vector and rebuilding links for this internal_id.
+            // If mmap_vector_storage::put_vector overwrites, we don't need to explicitly delete.
+            // Let's assume put_vector overwrites.
+        } else {
+            // New ID. Check capacity.
+            if self.next_internal_id >= self.mmap_vector_storage.capacity() {
+                return Err(VortexError::StorageFull);
+            }
+            internal_id = self.next_internal_id;
+            self.next_internal_id += 1; // Increment for next new insert.
+            self.vector_map.insert(vector_id.clone(), internal_id);
+            self.reverse_vector_map.insert(internal_id, vector_id.clone());
+            debug!(?vector_id, %internal_id, "Storing new vector in segment, updated maps.");
         }
         
-        // Check capacity before assigning new internal ID
-        if self.next_internal_id >= self.mmap_vector_storage.capacity() {
-            return Err(VortexError::StorageFull);
-        }
-
-        let internal_id = self.next_internal_id;
         self.mmap_vector_storage.put_vector(internal_id, &embedding)?;
         
-        self.next_internal_id += 1; // Increment only after successful put_vector
-        self.vector_map.insert(vector_id.clone(), internal_id);
-        self.reverse_vector_map.insert(internal_id, vector_id.clone());
-        debug!(?vector_id, %internal_id, "Stored vector in segment, updated maps.");
-        
-        // Now perform HNSW graph insertion
+        // Now perform HNSW graph insertion/update for this internal_id
+        // This will build/rebuild connections for the node at internal_id.
         self.hnsw_insert_vector(internal_id, &embedding)?;
-        Ok(())
+        
+        Ok(is_new_insert)
     }
 
     async fn delete_vector(&mut self, vector_id: &VectorId) -> Result<(), VortexError> {

@@ -8,6 +8,8 @@ pub mod persistence;
 pub mod state;
 pub mod wal;
 pub mod payload_index;
+pub mod grpc_api; // For generated gRPC code
+pub mod grpc_services; // For gRPC service implementations
 // wal_manager is part of the wal module, so it's accessible via pub mod wal;
 // wal_integration_tests.rs is a test file, not typically part of lib.rs
 

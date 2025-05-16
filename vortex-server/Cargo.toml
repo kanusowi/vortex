@@ -16,6 +16,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 tower-http = { workspace = true }
 hyper = { workspace = true }
+ndarray = { version = "0.15", features = ["serde"] } # Added ndarray
 # wal = "1.0" # Removed, as we are building our own WAL module
 serde_cbor = "0.11"
 rocksdb = { version = "0.22.0", features = ["snappy", "lz4"] }
@@ -31,6 +32,15 @@ rustix = { version = "0.38", features = [ "fs", "time" ] } # Needed for ftruncat
 crossbeam-channel = "0.5"
 futures = "0.3" # For futures::executor::block_on
 
+# gRPC dependencies
+tonic = "0.11"
+prost = "0.12"
+prost-types = "0.12" # For google.protobuf.Struct and other well-known types
+
+[build-dependencies]
+tonic-build = { version = "0.11", features = ["prost"] }
+
 [dev-dependencies]
 tempfile = "3.10.1" # For tests
 env_logger = "0.11.3" # For test logging
+tokio-stream = { version = "0.1", features = ["net"] } # For TcpListenerStream

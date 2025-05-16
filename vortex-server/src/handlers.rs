@@ -67,9 +67,6 @@ pub async fn create_index(
     }
 
     // Create the HNSW index instance
-    // TODO: Capacity should be configurable via CreateIndexRequest and server defaults.
-    const DEFAULT_CAPACITY: u64 = 1_000_000; // Example default capacity
-
     let data_path_buf = app_state_guard.data_path.clone(); // Clone PathBuf from AppState guard
     let base_path = &data_path_buf; // Use reference to the cloned PathBuf
 
@@ -102,7 +99,7 @@ pub async fn create_index(
         config: payload.config, // Assuming CreateIndexRequest.config is HnswConfig
         metric: payload.metric, // Assuming CreateIndexRequest.metric is DistanceMetric
         dimensions: payload.dimensions as u32,
-        capacity: DEFAULT_CAPACITY, // This should align with HnswIndex::new
+        // capacity: DEFAULT_CAPACITY, // Removed
     };
 
     if let Err(e) = wal_manager.log_operation(&create_index_record).await { // Added .await
@@ -357,7 +354,7 @@ pub async fn search_vectors(
 
 /// Helper function to check if a metadata object matches a filter object.
 /// For V1, this implements a simple exact match for all key-value pairs in the filter.
-fn matches_filter(
+pub fn matches_filter( // Made public
     metadata: &serde_json::Map<String, serde_json::Value>,
     filter: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {

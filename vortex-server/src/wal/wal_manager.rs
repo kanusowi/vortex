@@ -36,7 +36,7 @@ pub enum WalRecord {
         config: HnswConfig,
         metric: DistanceMetric,
         dimensions: u32,
-        capacity: u64,
+        // capacity: u64, // Removed as it's not used by HnswIndex during WAL replay
     },
     AddVector {
         // index_name: String, // Not strictly needed if WAL is per-index, but good for clarity
@@ -47,6 +47,9 @@ pub enum WalRecord {
     DeleteVector {
         // index_name: String,
         vector_id: VectorId,
+    },
+    DeleteCollection { // Added new variant
+        name: String,
     },
 }
 
@@ -171,7 +174,7 @@ mod tests {
             config: HnswConfig::default(),
             metric: DistanceMetric::Cosine,
             dimensions: 2,
-            capacity: 100,
+            // capacity: 100, // Removed
         }
     }
 

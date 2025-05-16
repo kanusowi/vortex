@@ -1,0 +1,22 @@
+version: v1
+plugins:
+  # For Rust, we'll use tonic-build directly in vortex-server/build.rs.
+  # However, we can define linters/formatters here.
+  # Example for protoc-gen-buf-lint (if we wanted to use buf's linter explicitly during generation)
+  # - name: buf-lint
+  #   out: .
+  #   opt:
+  #     - "all"
+
+  # Example for future Go generation (if needed)
+  # - plugin: buf.build/protocolbuffers/go:v1.31.0
+  #   out: gen/go
+  #   opt: paths=source_relative
+
+  # Example for future TypeScript generation (if needed)
+  # - plugin: buf.build/bufbuild/es:v1.4.2
+  #   out: gen/ts
+  #   opt: target=ts
+  # - plugin: buf.build/connectrpc/es:v0.13.0 # Or connect-grpchey
+  #   out: gen/ts
+  #   opt: target=ts
