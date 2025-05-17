@@ -405,6 +405,11 @@ impl SimpleSegment {
         Ok(results)
     }
 
+    /// Estimates the total size of memory-mapped files used by this segment.
+    pub fn estimate_mapped_size(&self) -> u64 {
+        self.mmap_vector_storage.mapped_size() + self.mmap_hnsw_graph_links.mapped_size()
+    }
+
     // Helper methods for tests in index.rs
     #[cfg(test)] // Keep these for tests only
     pub(crate) fn vector_map_len(&self) -> usize {
@@ -432,13 +437,13 @@ impl Segment for SimpleSegment {
             )));
         }
 
-        let mut is_new_insert = true;
+        let is_new_insert: bool;
         let internal_id: u64;
 
-        if let Some(&existing_internal_id) = self.vector_map.get(&vector_id) {
+        if let Some(&existing_id) = self.vector_map.get(&vector_id) {
             // ID exists, this is an update.
             is_new_insert = false;
-            internal_id = existing_internal_id;
+            internal_id = existing_id;
             debug!(?vector_id, %internal_id, "Updating existing vector in segment.");
             // Mark old vector data as deleted. The HNSW graph links for this internal_id will be rebuilt.
             // Note: A more robust HNSW update might involve removing the node from graph first.
@@ -446,6 +451,7 @@ impl Segment for SimpleSegment {
             // If mmap_vector_storage::put_vector overwrites, we don't need to explicitly delete.
             // Let's assume put_vector overwrites.
         } else {
+            is_new_insert = true;
             // New ID. Check capacity.
             if self.next_internal_id >= self.mmap_vector_storage.capacity() {
                 return Err(VortexError::StorageFull);
@@ -669,7 +675,7 @@ mod tests {
         
         // Try to insert existing ID (should error based on current SimpleSegment::insert_vector)
         let insert_dup_res = segment.insert_vector(vec_id2.clone(), emb2.clone()).await;
-        assert!(matches!(insert_dup_res, Err(VortexError::StorageError(_))), "Inserting duplicate ID should error");
+        assert!(matches!(insert_dup_res, Ok(false)), "Inserting duplicate ID should return Ok(false)");
 
     }
     

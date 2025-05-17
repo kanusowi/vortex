@@ -46,6 +46,10 @@ pub trait Index: Send + Sync + std::fmt::Debug {
 
     /// Searches for the k nearest neighbors using a specified ef_search value.
     async fn search_with_ef(&self, query: Embedding, k: usize, ef_search: usize) -> VortexResult<Vec<(VectorId, f32)>>;
+
+    /// Estimates the total size of memory-mapped files used by the index.
+    /// This is an approximation of potential RAM usage if all mapped files were resident.
+    fn estimate_ram_footprint(&self) -> u64;
 }
 
 // /// Data structure representing the HNSW index state for serialization.
@@ -430,6 +434,22 @@ impl Index for HnswIndex {
         let segment = self.segments[0].read().await;
         debug!(segment_path=?segment.path(), ?limit, "HnswIndex::list_vectors delegating to segment 0.");
         segment.list_vectors(limit).await
+    }
+
+    fn estimate_ram_footprint(&self) -> u64 {
+        // Sum estimated mapped sizes of all segments.
+        // This requires awaiting read locks, so it cannot be truly sync without block_on.
+        // For a quick estimate without async in trait, we'll use block_on.
+        // A better long-term solution might involve HnswIndex tracking this,
+        // or making estimate_ram_footprint async in the trait.
+        futures::executor::block_on(async {
+            let mut total_mapped_size = 0;
+            for segment_arc in &self.segments {
+                let segment_guard = segment_arc.read().await;
+                total_mapped_size += segment_guard.estimate_mapped_size();
+            }
+            total_mapped_size
+        })
     }
 }
 

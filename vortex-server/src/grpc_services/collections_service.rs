@@ -155,10 +155,15 @@ impl CollectionsService for CollectionsServerImpl {
         };
 
         if let Err(e) = wal_manager.log_operation(&create_index_record).await {
-            error!(collection_name = %req_inner.collection_name, error = ?e, "CRITICAL: Failed to log CreateCollection to WAL after index files were created.");
+            error!(collection_name = %req_inner.collection_name, error = ?e, "CRITICAL: Failed to log CreateCollection to WAL after index files were created. Cleaning up HNSW index files.");
+            // Attempt to remove the HNSW index files from disk
+            let collection_disk_path = data_path_buf.join(&req_inner.collection_name);
+            if let Err(cleanup_err) = tokio::fs::remove_dir_all(&collection_disk_path).await {
+                error!(collection_name = %req_inner.collection_name, path = ?collection_disk_path, error = ?cleanup_err, "Failed to cleanup collection directory after WAL logging failure.");
+                // Log this error, but proceed to remove from in-memory map and return original WAL error
+            }
             app_state_guard.indices.write().await.remove(&req_inner.collection_name);
-            // Consider deleting HNSW files from disk here.
-            return Err(Status::internal(format!("Failed to log CreateCollection to WAL: {:?}", e)));
+            return Err(Status::internal(format!("Failed to log CreateCollection to WAL: {:?}. Associated index files attempted to be cleaned up.", e)));
         }
 
         let mut wal_managers_map_writer = app_state_guard.wal_managers.write().await;
@@ -212,16 +217,21 @@ impl CollectionsService for CollectionsServerImpl {
                 let vector_count = index_guard.len() as u64;
                 let segment_count = index_guard.segment_count() as u64;
                 
-                // TODO: Implement actual disk size calculation
-                let disk_size_placeholder = 0; 
-                tracing::debug!("Placeholder value used for disk_size_bytes in GetCollectionInfoResponse");
-                // TODO: Implement actual RAM footprint estimation
-                let ram_footprint_placeholder = 0; 
-                tracing::debug!("Placeholder value used for ram_footprint_bytes in GetCollectionInfoResponse");
-                // TODO: Implement actual status reporting
-                let current_status = CollectionStatus::Green; 
-                tracing::debug!("Placeholder value used for status in GetCollectionInfoResponse");
-
+                let collection_path = app_state_guard.data_path.join(&req_inner.collection_name);
+                let disk_size_bytes = fs_extra::dir::get_size(&collection_path).unwrap_or(0);
+                
+                let estimated_ram_footprint = index_guard.estimate_ram_footprint();
+                debug!(ram_bytes = estimated_ram_footprint, "Estimated RAM footprint from index_guard.");
+                
+                // Basic status check: if index directory and key files exist.
+                // A more robust status would involve checking segment health, WAL status, etc.
+                let current_status = if collection_path.exists() && 
+                                        collection_path.join(format!("{}.hnsw_meta.json", req_inner.collection_name)).exists() {
+                    CollectionStatus::Green // Simplified status
+                } else {
+                    CollectionStatus::Yellow // Or Red if critical files are missing
+                };
+                tracing::debug!(status = ?current_status, "Determined status for GetCollectionInfoResponse");
 
                 info!(collection_name = %req_inner.collection_name, "Returning collection info");
                 Ok(Response::new(GetCollectionInfoResponse {
@@ -229,8 +239,8 @@ impl CollectionsService for CollectionsServerImpl {
                     status: current_status.into(),
                     vector_count,
                     segment_count,
-                    disk_size_bytes: disk_size_placeholder,
-                    ram_footprint_bytes: ram_footprint_placeholder,
+                    disk_size_bytes,
+                    ram_footprint_bytes: estimated_ram_footprint,
                     config: Some(proto_config),
                     distance_metric: proto_metric.into(),
                 }))
@@ -261,14 +271,19 @@ impl CollectionsService for CollectionsServerImpl {
             let core_config = index_guard.config();
             let proto_metric = core_to_proto_distance_metric(index_guard.distance_metric());
             
-            // TODO: Implement actual status reporting for each collection in the list
-            let current_status = CollectionStatus::Green;
-            tracing::debug!(collection_name = %name, "Placeholder value used for status in ListCollectionsResponse for collection");
+            let collection_path_desc = app_state_guard.data_path.join(name);
+            let current_status_desc = if collection_path_desc.exists() &&
+                                         collection_path_desc.join(format!("{}.hnsw_meta.json", name)).exists() {
+                CollectionStatus::Green
+            } else {
+                CollectionStatus::Yellow
+            };
+            tracing::debug!(collection_name = %name, status = ?current_status_desc, "Determined status for ListCollectionsResponse item");
 
             collection_descriptions.push(CollectionDescription {
                 name: name.clone(),
                 vector_count: index_guard.len() as u64,
-                status: current_status.into(),
+                status: current_status_desc.into(),
                 dimensions: core_config.vector_dim,
                 distance_metric: proto_metric.into(),
             });

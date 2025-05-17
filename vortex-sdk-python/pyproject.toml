@@ -1,0 +1,83 @@
+[tool.poetry]
+name = "vortex-sdk"
+version = "0.1.0"
+description = "Python SDK for Vortex Vector Database"
+authors = ["Cline <cline@vortex.ai>"]
+license = "Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/vortex-db/vortex-sdk-python"  # Placeholder
+repository = "https://github.com/vortex-db/vortex-sdk-python" # Placeholder
+keywords = ["vortex", "vector", "database", "sdk"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+grpcio = ">=1.64.0,<2.0.0"  # Updated grpcio constraint
+protobuf = ">=5.26.1,<6.0.0"
+pydantic = ">=2.0,<3.0"
+httpx = ">=0.23.0,<0.28.0" # Qdrant uses 0.23.0 - 0.27.0, keeping similar range
+numpy = "^1.26.0" # Updated constraint, was ">=1.21.0,<2.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0,<8.0.0"
+pytest-asyncio = ">=0.18.0,<0.24.0" # Qdrant uses 0.21.0, latest is 0.23.6
+pytest-mock = ">=3.6.0,<4.0.0" # Qdrant uses 3.10.0, latest is 3.12.0
+mypy = ">=1.0.0,<2.0.0" # Qdrant uses 1.5.1, latest is 1.9.0
+grpcio-tools = ">=1.64.0,<2.0.0" # Updated grpcio-tools constraint
+ruff = ">=0.1.0,<0.5.0" # Using a broader range for ruff as it's rapidly evolving. Qdrant uses 0.1.7
+types-protobuf = ">=4.21.0,<5.0.0" # For protobuf type hints, qdrant uses 4.24.0.4
+
+[tool.poetry.scripts]
+generate-stubs = "scripts.generate_grpc_stubs:main"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+select = ["E", "W", "F", "I", "C", "B", "ASYNC", "PTH", "Q"] # Common useful rules (TCH removed)
+ignore = ["E501"] # Let ruff format handle line length
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true # Initially, to handle generated gRPC code
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_calls = true
+# Strict mode options, can be enabled progressively
+# strict_optional = true
+# warn_no_return = true
+# warn_redundant_casts = true
+# warn_unused_ignores = true
+# disallow_untyped_decorators = true
+# disallow_any_generics = true
+
+[[tool.mypy.overrides]]
+module = "vortex_sdk._grpc.*" # Assuming generated code might not be perfectly typed
+ignore_errors = true
+
+[tool.pytest.ini_options]
+markers = [
+    "skip_connect_mock: skips the _connect mock in client fixtures for connection tests"
+]

@@ -210,6 +210,11 @@ impl MmapVectorStorage {
         self.header.vector_count == 0
     }
 
+    /// Returns the total size of the memory-mapped regions for data and deletion flags.
+    pub fn mapped_size(&self) -> u64 {
+        self.data_mmap.len() as u64 + self.deletion_flags_mmap.len() as u64
+    }
+
     fn vector_offset(&self, internal_id: u64) -> usize {
         size_of::<MmapFileHeader>() 
             + (internal_id as usize * self.header.dimensionality as usize * size_of::<f32>())

@@ -148,6 +148,13 @@ impl CollectionWalManager {
             .map_err(|e| WalError::VortexWLogError { path: self.wal_dir_path.clone(), source: e})
     }
 
+    pub async fn flush(&self) -> Result<(), WalError> {
+        let mut wal_guard = self.vortex_wal.lock().await;
+        // The flush_async method is on VortexSegment, which is part of OpenVortexSegment in VortexWal
+        wal_guard.open_segment.segment.flush_async().await
+            .map_err(|e| WalError::VortexWLogError { path: self.wal_dir_path.clone(), source: e })
+    }
+
     pub fn get_wal_path_for_index(base_data_path: &Path, index_name: &str) -> PathBuf {
         base_data_path.join(index_name).join("wal")
     }

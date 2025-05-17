@@ -256,6 +256,11 @@ impl MmapHnswGraphLinks {
     pub fn flush(&self) -> Result<(), VortexError> {
         self.mmap.flush().map_err(|e| VortexError::StorageError(format!("Failed to flush graph mmap: {}", e)))
     }
+
+    /// Returns the total size of the memory-mapped graph file.
+    pub fn mapped_size(&self) -> u64 {
+        self.mmap.len() as u64
+    }
     
     /// Updates the entry point node ID in the header and flushes the header to disk.
     pub fn set_entry_point_node_id(&mut self, entry_point_id: u64) -> Result<(), VortexError> {

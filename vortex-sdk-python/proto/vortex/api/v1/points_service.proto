@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package vortex.api.v1;
+
+import "vortex/api/v1/common.proto";
+
+option go_package = "github.com/vortex-db/vortex/proto/vortex/api/v1;vortex_api_v1";
+option java_package = "io.vortexdb.api.v1";
+option java_multiple_files = true;
+option java_outer_classname = "PointsServiceProto";
+
+// Service for managing points (vectors and their payloads).
+service PointsService {
+  // Upserts (adds or updates) points in a collection.
+  rpc UpsertPoints(UpsertPointsRequest) returns (UpsertPointsResponse);
+
+  // Retrieves points by their IDs.
+  rpc GetPoints(GetPointsRequest) returns (GetPointsResponse);
+
+  // Deletes points from a collection by their IDs.
+  rpc DeletePoints(DeletePointsRequest) returns (DeletePointsResponse);
+
+  // Performs a k-NN search for similar points.
+  rpc SearchPoints(SearchPointsRequest) returns (SearchPointsResponse);
+
+  // TODO: Add BatchSearchPoints, ScrollPoints, RecommendPoints, QueryPoints (more generic query) later.
+  // TODO: Add UpdateVectors, SetPayload, ClearPayload, CountPoints later.
+}
+
+// Request to upsert points.
+message UpsertPointsRequest {
+  string collection_name = 1;         // Name of the collection.
+  repeated PointStruct points = 2;    // List of points to upsert.
+  optional bool wait_flush = 3;       // If true, wait for WAL to be flushed to disk.
+}
+
+// Response for UpsertPoints.
+message UpsertPointsResponse {
+  repeated PointOperationStatus statuses = 1; // Status for each point operation.
+  optional string overall_error = 2;          // If a general error occurred.
+}
+
+// Request to retrieve points by IDs.
+message GetPointsRequest {
+  string collection_name = 1;         // Name of the collection.
+  repeated string ids = 2;            // List of point IDs to retrieve.
+  optional bool with_payload = 3;     // If true, include payload in the response. Defaults to true.
+  optional bool with_vector = 4;      // If true, include vector in the response. Defaults to false.
+}
+
+// Response for GetPoints.
+message GetPointsResponse {
+  repeated PointStruct points = 1;    // List of retrieved points.
+  // Note: Points not found will be omitted from the list.
+  // Client can compare requested IDs with returned IDs to identify missing ones.
+}
+
+// Request to delete points by IDs.
+message DeletePointsRequest {
+  string collection_name = 1;         // Name of the collection.
+  repeated string ids = 2;            // List of point IDs to delete.
+  optional bool wait_flush = 3;       // If true, wait for WAL to be flushed.
+  // TODO: Add filter-based deletion later.
+}
+
+// Response for DeletePoints.
+message DeletePointsResponse {
+  repeated PointOperationStatus statuses = 1; // Status for each deletion.
+  optional string overall_error = 2;
+}
+
+// Request to search for similar points.
+message SearchPointsRequest {
+  string collection_name = 1;         // Name of the collection.
+  Vector query_vector = 2;            // The vector to search for.
+  uint32 k_limit = 3;                 // Number of nearest neighbors to return.
+  optional Filter filter = 4;         // Filter conditions to apply before search.
+  optional bool with_payload = 5;     // If true, include payload in results. Defaults to true.
+  optional bool with_vector = 6;      // If true, include vector in results. Defaults to false.
+  optional SearchParams params = 7;   // Additional search parameters (e.g., ef_search).
+  // TODO: Add offset, score_threshold, consistency_params later.
+}
+
+// Response for SearchPoints.
+message SearchPointsResponse {
+  repeated ScoredPoint results = 1;   // List of search results.
+  // TODO: Add timing information, total hits (if filter applied) later.
+}

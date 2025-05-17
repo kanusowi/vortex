@@ -20,6 +20,8 @@ use crate::grpc_api::vortex_api_v1::{
 use crate::wal::wal_manager::WalRecord;
 use vortex_core::{Embedding, Index};
 
+pub const VERSION_KEY: &str = "_vortex_version";
+
 // Helper to convert prost_types::Value to serde_json::Value
 fn proto_value_to_serde_json_value(proto_value: prost_types::Value) -> Result<serde_json::Value, Status> {
     match proto_value.kind {
@@ -143,10 +145,7 @@ impl PointsService for PointsServerImpl {
             wait_flush = req_inner.wait_flush.unwrap_or(false),
             "RPC: UpsertPoints received"
         );
-        if req_inner.wait_flush.unwrap_or(false) {
-            // TODO: Implement actual wait_flush logic in WAL and call it here.
-            debug!("wait_flush=true is requested but not yet fully implemented for UpsertPoints.");
-        }
+        // wait_flush logic is implemented later in this function by calling wal_manager_arc.flush().await
 
         if req_inner.collection_name.is_empty() {
             return Err(Status::invalid_argument("Collection name cannot be empty"));
@@ -243,11 +242,12 @@ impl PointsService for PointsServerImpl {
 
         for point_proto in validated_points { // point_proto is PointStruct
             let point_id_str = point_proto.id.clone(); // Changed: PointStruct.id is String
-            let vector_elements = point_proto.vector.unwrap().elements; 
-            let core_embedding = Embedding::from(vector_elements); 
-            
-            let core_payload_opt = match proto_payload_to_serde_json(point_proto.payload) {
-                Ok(p) => p,
+            let vector_elements = point_proto.vector.unwrap().elements;
+            let core_embedding = Embedding::from(vector_elements);
+
+            // Convert incoming gRPC payload to Option<serde_json::Value>
+            let parsed_serde_payload = match proto_payload_to_serde_json(point_proto.payload) { // Removed mut
+                Ok(p) => p, // p is Option<serde_json::Value>
                 Err(e) => {
                     statuses.push(PointOperationStatus {
                         point_id: point_id_str.clone(),
@@ -258,17 +258,84 @@ impl PointsService for PointsServerImpl {
                     continue;
                 }
             };
+
+            // Versioning logic
+            let is_new_insert = match index_guard.get_vector(&point_id_str).await {
+                Ok(Some(_)) => false, // Vector exists, so it's an update
+                Ok(None) => true,     // Vector does not exist, so it's a new insert
+                Err(e) => {
+                    error!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to check vector existence for versioning");
+                    statuses.push(PointOperationStatus {
+                        point_id: point_id_str.clone(),
+                        status_code: StatusCode::Error.into(),
+                        error_message: Some(format!("Error checking vector existence: {}", e)),
+                    });
+                    if overall_error_message.is_none() { overall_error_message = Some("Failed to determine if point is new or update for versioning.".to_string()); }
+                    continue;
+                }
+            };
+
+            let current_version = if is_new_insert {
+                1
+            } else {
+                match payload_db_arc.get_payload(&point_id_str) {
+                    Ok(Some(existing_payload_json)) => {
+                        existing_payload_json
+                            .get(VERSION_KEY)
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) + 1
+                    }
+                    Ok(None) => 1, 
+                    Err(e) => {
+                        warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to get existing payload for versioning. Defaulting to version 1.");
+                        1
+                    }
+                }
+            };
+            
+            let final_payload_for_storage: Option<serde_json::Value>;
+            match parsed_serde_payload {
+                Some(serde_json::Value::Object(mut map)) => {
+                    map.insert(VERSION_KEY.to_string(), serde_json::json!(current_version));
+                    final_payload_for_storage = Some(serde_json::Value::Object(map));
+                }
+                Some(other_json_value) => {
+                    // This case should be logically unreachable if proto_payload_to_serde_json works as expected,
+                    // as it should only produce Some(Object) or None when Ok.
+                    error!(collection_name = %req_inner.collection_name, point_id = %point_id_str, payload = ?other_json_value, "Internal error: parsed payload was Some but not an Object. This indicates a bug in payload conversion.");
+                    statuses.push(PointOperationStatus {
+                        point_id: point_id_str.clone(),
+                        status_code: StatusCode::Error.into(), // Changed from Internal to Error
+                        error_message: Some("Internal error: payload parsed into unexpected non-object type.".to_string()),
+                    });
+                    if overall_error_message.is_none() { overall_error_message = Some("Internal error processing payload.".to_string()); }
+                    continue; // Skip this point
+                }
+                None => {
+                    // Incoming payload is None.
+                    if is_new_insert {
+                        // New point with no payload. Store no payload.
+                        final_payload_for_storage = None;
+                    } else {
+                        // Update to an existing point, but request wants to set payload to None.
+                        // Store a payload containing only the version.
+                        let mut version_only_map = serde_json::Map::new();
+                        version_only_map.insert(VERSION_KEY.to_string(), serde_json::json!(current_version));
+                        final_payload_for_storage = Some(serde_json::Value::Object(version_only_map));
+                    }
+                }
+            }
             
             let wal_record = WalRecord::AddVector {
                 vector_id: point_id_str.clone(),
                 vector: core_embedding.clone(),
-                metadata: core_payload_opt.clone(),
+                metadata: final_payload_for_storage.clone(),
             };
 
             if let Err(e) = wal_manager_arc.log_operation(&wal_record).await {
                 error!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to log AddVector to WAL");
                 statuses.push(PointOperationStatus {
-                    point_id: point_id_str,
+                    point_id: point_id_str.clone(),
                     status_code: StatusCode::Error.into(),
                     error_message: Some(format!("WAL error: {}", e)),
                 });
@@ -277,28 +344,40 @@ impl PointsService for PointsServerImpl {
             }
 
             match index_guard.add_vector(point_id_str.clone(), core_embedding).await {
-                Ok(_added) => {
-                    if let Some(payload_val) = core_payload_opt {
-                        if let Err(e_payload) = payload_db_arc.set_payload(&point_id_str, &payload_val) {
-                            warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e_payload, "Failed to set payload in RocksDB. Vector added to HNSW, but payload failed.");
+                Ok(_was_new_in_hnsw) => {
+                    if let Some(payload_to_set) = &final_payload_for_storage {
+                        if let Err(e_payload) = payload_db_arc.set_payload(&point_id_str, payload_to_set) {
+                            warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e_payload, "Failed to set payload in RocksDB.");
                             statuses.push(PointOperationStatus {
-                                point_id: point_id_str,
-                                status_code: StatusCode::Ok.into(),
-                                error_message: Some("Vector upserted, but payload update failed.".to_string()),
+                                point_id: point_id_str.clone(),
+                                status_code: StatusCode::Ok.into(), 
+                                error_message: Some("Vector upserted, but payload set operation failed.".to_string()),
                             });
                         } else {
                              statuses.push(PointOperationStatus {
-                                point_id: point_id_str,
+                                point_id: point_id_str.clone(),
                                 status_code: StatusCode::Ok.into(),
                                 error_message: None,
                             });
                         }
-                    } else {
-                        statuses.push(PointOperationStatus {
-                            point_id: point_id_str,
-                            status_code: StatusCode::Ok.into(),
-                            error_message: None,
-                        });
+                    } else { // final_payload_for_storage is None (new insert with no payload)
+                        // Ensure any potentially pre-existing payload (e.g. from a previous life of this point_id_str) is cleared.
+                        // This is mainly for logical consistency, as a new insert shouldn't have old payload.
+                        if let Err(e_payload_del) = payload_db_arc.delete_payload(&point_id_str) {
+                             warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e_payload_del, "Failed to delete pre-existing payload for new point with no payload.");
+                             // Still count as Ok for the point itself.
+                             statuses.push(PointOperationStatus {
+                                point_id: point_id_str.clone(),
+                                status_code: StatusCode::Ok.into(),
+                                error_message: Some("Vector inserted, but failed to ensure old payload cleared.".to_string()),
+                            });
+                        } else {
+                            statuses.push(PointOperationStatus {
+                                point_id: point_id_str.clone(),
+                                status_code: StatusCode::Ok.into(),
+                                error_message: None,
+                            });
+                        }
                     }
                 }
                 Err(e) => {
@@ -310,6 +389,19 @@ impl PointsService for PointsServerImpl {
                     });
                     if overall_error_message.is_none() { overall_error_message = Some("One or more points failed during HNSW add.".to_string()); }
                 }
+            }
+        }
+
+        if req_inner.wait_flush.unwrap_or(false) {
+            debug!(collection_name = %req_inner.collection_name, "Executing wait_flush for UpsertPoints.");
+            if let Err(e_flush) = wal_manager_arc.flush().await {
+                error!(collection_name = %req_inner.collection_name, error = ?e_flush, "Failed to flush WAL for UpsertPoints");
+                if overall_error_message.is_none() {
+                    overall_error_message = Some(format!("WAL flush error: {}", e_flush));
+                }
+                // Potentially update statuses if a specific error code for flush failure is desired
+            } else {
+                debug!(collection_name = %req_inner.collection_name, "WAL flush successful for UpsertPoints.");
             }
         }
         
@@ -365,7 +457,9 @@ impl PointsService for PointsServerImpl {
             
             let mut proto_vector: Option<ProtoVector> = None;
             let mut proto_payload: Option<ProtoPayload> = None;
+            let mut point_version: Option<u64> = None; // Added for version
             let mut point_exists = false;
+            let mut fetched_payload_for_version_logic: Option<serde_json::Value> = None; // To store payload if fetched
 
             if include_vector {
                 match index_guard.get_vector(point_id_str_val).await {
@@ -394,6 +488,7 @@ impl PointsService for PointsServerImpl {
                 if let Some(payload_db) = &payload_db_arc_opt {
                     match payload_db.get_payload(point_id_str_val) {
                         Ok(Some(json_val)) => {
+                            fetched_payload_for_version_logic = Some(json_val.clone()); // Store for version extraction
                             match serde_json_to_proto_payload(Some(json_val)) {
                                 Ok(p) => proto_payload = p,
                                 Err(e) => {
@@ -410,12 +505,33 @@ impl PointsService for PointsServerImpl {
                      warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str_val, "Payload DB not found for GetPoints, cannot retrieve payload.");
                 }
             }
+
+            // Fetch version if point exists
+            if point_exists {
+                if let Some(payload_json) = &fetched_payload_for_version_logic {
+                    point_version = payload_json.get(VERSION_KEY).and_then(|v| v.as_u64());
+                } else {
+                    // Payload wasn't fetched (e.g. include_payload was false), fetch it now for version
+                    if let Some(payload_db_for_version) = &payload_db_arc_opt {
+                        match payload_db_for_version.get_payload(point_id_str_val) {
+                            Ok(Some(payload_for_version)) => {
+                                point_version = payload_for_version.get(VERSION_KEY).and_then(|v| v.as_u64());
+                            }
+                            Ok(None) => { /* No payload, so no version */ }
+                            Err(e) => {
+                                warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str_val, error = ?e, "Failed to get payload for version retrieval in GetPoints.");
+                            }
+                        }
+                    }
+                }
+            }
             
             if point_exists { 
                  result_points.push(PointStruct {
-                    id: point_id_str_val_loop.clone(), // Changed: PointStruct.id is String
+                    id: point_id_str_val_loop.clone(), 
                     vector: proto_vector,
                     payload: proto_payload,
+                    version: point_version,
                 });
             }
         }
@@ -435,10 +551,7 @@ impl PointsService for PointsServerImpl {
             wait_flush = req_inner.wait_flush.unwrap_or(false),
             "RPC: DeletePoints received"
         );
-        if req_inner.wait_flush.unwrap_or(false) {
-            // TODO: Implement actual wait_flush logic in WAL and call it here.
-            debug!("wait_flush=true is requested but not yet fully implemented for DeletePoints.");
-        }
+        // wait_flush logic is implemented later in this function by calling wal_manager_arc.flush().await
 
         if req_inner.collection_name.is_empty() {
             return Err(Status::invalid_argument("Collection name cannot be empty"));
@@ -544,6 +657,20 @@ impl PointsService for PointsServerImpl {
                 }
             }
         }
+
+        if req_inner.wait_flush.unwrap_or(false) {
+            debug!(collection_name = %req_inner.collection_name, "Executing wait_flush for DeletePoints.");
+            if let Err(e_flush) = wal_manager_arc.flush().await {
+                error!(collection_name = %req_inner.collection_name, error = ?e_flush, "Failed to flush WAL for DeletePoints");
+                if overall_error_message.is_none() {
+                    overall_error_message = Some(format!("WAL flush error: {}", e_flush));
+                }
+                // Potentially update statuses
+            } else {
+                debug!(collection_name = %req_inner.collection_name, "WAL flush successful for DeletePoints.");
+            }
+        }
+
         info!(collection_name = %req_inner.collection_name, num_statuses = statuses.len(), "RPC: DeletePoints completed");
         Ok(Response::new(DeletePointsResponse { statuses, overall_error: overall_error_message }))
     }
@@ -645,31 +772,31 @@ impl PointsService for PointsServerImpl {
 
             let point_id_str = id_val.clone();
             let score = *score_val;
-            let mut result_proto_payload: Option<ProtoPayload> = None;
+            
+            let mut fetched_serde_payload: Option<serde_json::Value> = None;
             let mut result_proto_vector: Option<ProtoVector> = None;
-
             let mut passes_filter = true;
 
+            // 1. Handle filtering and fetch payload if needed for filtering
             if let Some(serde_filter_val) = &serde_filter_opt {
                 if let Some(payload_db) = &payload_db_arc_opt {
                     match payload_db.get_payload(&point_id_str) {
-                        Ok(Some(actual_payload_json)) => {
-                            if let (Some(filter_obj_map), Some(payload_obj_map)) = (serde_filter_val.as_object(), actual_payload_json.as_object()) {
+                        Ok(Some(payload_json_for_filter)) => {
+                            // Store the fetched payload regardless of filter outcome for potential reuse
+                            fetched_serde_payload = Some(payload_json_for_filter.clone()); 
+                            if let (Some(filter_obj_map), Some(payload_obj_map)) = (serde_filter_val.as_object(), payload_json_for_filter.as_object()) {
                                 if !filter_obj_map.is_empty() {
                                     passes_filter = crate::handlers::matches_filter(payload_obj_map, filter_obj_map);
                                 }
                             } else { 
                                 passes_filter = serde_filter_val.as_object().map_or(true, |obj| obj.is_empty());
                             }
-                            if passes_filter && include_payload {
-                                result_proto_payload = serde_json_to_proto_payload(Some(actual_payload_json)).unwrap_or(None);
-                            }
                         }
-                        Ok(None) => { 
+                        Ok(None) => { // No payload for point
                             passes_filter = serde_filter_val.as_object().map_or(true, |obj| obj.is_empty());
                         }
                         Err(e) => {
-                            warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to get payload from RocksDB for search result. Assuming filter mismatch.");
+                            warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to get payload from RocksDB for search result filtering. Assuming filter mismatch.");
                             passes_filter = false;
                         }
                     }
@@ -677,39 +804,87 @@ impl PointsService for PointsServerImpl {
                     warn!(collection_name = %req_inner.collection_name, "Filter requested but PayloadIndexRocksDB not found. Assuming filter mismatch for all points.");
                     passes_filter = serde_filter_val.as_object().map_or(true, |obj| obj.is_empty());
                 }
-            } else if include_payload { 
-                 if let Some(payload_db) = &payload_db_arc_opt {
-                    if let Ok(Some(json_val)) = payload_db.get_payload(&point_id_str) {
-                        result_proto_payload = serde_json_to_proto_payload(Some(json_val)).unwrap_or(None);
-                    }
-                 }
             }
 
-            // TODO: Optimize payload fetching if filter is active and include_payload is true to avoid double fetch.
-            if passes_filter {
-                if include_vector {
-                    match index_guard.get_vector(&point_id_str).await {
-                        Ok(Some(embedding)) => {
-                            result_proto_vector = Some(core_embedding_to_proto_vector(&embedding));
+            if !passes_filter {
+                continue; // Skip to next search result if filter doesn't pass
+            }
+
+            // 2. Populate result_proto_payload if include_payload is true
+            // Use already fetched_serde_payload if available, otherwise fetch it.
+            let final_result_proto_payload: Option<ProtoPayload>;
+            if include_payload {
+                if fetched_serde_payload.is_some() {
+                    final_result_proto_payload = serde_json_to_proto_payload(fetched_serde_payload.clone()).unwrap_or(None);
+                } else {
+                    // Payload not fetched yet (e.g. no filter, or filter passed without needing payload content)
+                    if let Some(payload_db) = &payload_db_arc_opt {
+                        match payload_db.get_payload(&point_id_str) {
+                            Ok(Some(json_val)) => {
+                                fetched_serde_payload = Some(json_val.clone()); // Store for version extraction
+                                final_result_proto_payload = serde_json_to_proto_payload(Some(json_val)).unwrap_or(None);
+                            }
+                            Ok(None) => { final_result_proto_payload = None; }
+                            Err(e) => { 
+                                warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to get payload for output.");
+                                final_result_proto_payload = None; 
+                            }
                         }
-                        Ok(None) => { /* Should not happen if it was found in HNSW search */ }
+                    } else {
+                        final_result_proto_payload = None;
+                    }
+                }
+            } else {
+                final_result_proto_payload = None;
+            }
+
+            // 3. Get version from fetched_serde_payload if available, otherwise fetch payload specifically for version
+            let mut point_version_val: Option<u64> = None;
+            if let Some(payload_json) = &fetched_serde_payload {
+                point_version_val = payload_json.get(VERSION_KEY).and_then(|v| v.as_u64());
+            } else {
+                // Payload wasn't fetched for filter or include_payload, fetch it now just for version
+                // This case should be rare if include_payload is usually true or filters are common
+                if let Some(payload_db_for_version) = &payload_db_arc_opt {
+                    match payload_db_for_version.get_payload(&point_id_str) {
+                        Ok(Some(payload_for_version)) => {
+                            point_version_val = payload_for_version.get(VERSION_KEY).and_then(|v| v.as_u64());
+                        }
+                        Ok(None) => { /* No payload, so no version */ }
                         Err(e) => {
-                             warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to re-fetch vector for search result.");
+                            warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to get payload for version retrieval.");
                         }
                     }
                 }
-                // TODO: Implement actual versioning for points.
-                let current_version = Some(0); 
-                debug!(point_id = %point_id_str, "Placeholder value used for version in ScoredPoint");
-
-                final_proto_results.push(crate::grpc_api::vortex_api_v1::ScoredPoint {
-                    id: point_id_str, 
-                    payload: result_proto_payload,
-                    vector: result_proto_vector,
-                    score,
-                    version: current_version,
-                });
             }
+            // If version_val is still None, it means version key wasn't found or payload error.
+            // ScoredPoint.version is Option<u64>, so None is acceptable.
+            // For consistency with previous logic that defaulted to Some(0), we can do:
+            let final_point_version = point_version_val; // Version is None if not found or error
+
+
+            // 4. Populate vector if include_vector is true
+            if include_vector {
+                match index_guard.get_vector(&point_id_str).await {
+                    Ok(Some(embedding)) => {
+                        result_proto_vector = Some(core_embedding_to_proto_vector(&embedding));
+                    }
+                    Ok(None) => { /* Should not happen if it was found in HNSW search, but handle defensively */ 
+                        warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, "Vector not found during re-fetch for search result.");
+                    }
+                    Err(e) => {
+                         warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to re-fetch vector for search result.");
+                    }
+                }
+            }
+
+            final_proto_results.push(crate::grpc_api::vortex_api_v1::ScoredPoint {
+                id: point_id_str,
+                payload: final_result_proto_payload,
+                vector: result_proto_vector,
+                score,
+                version: final_point_version,
+            });
         }
         
         info!(collection_name = %req_inner.collection_name, num_results = final_proto_results.len(), "RPC: SearchPoints completed");

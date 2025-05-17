@@ -25,7 +25,6 @@ message PointStruct {
   string id = 1;
   Vector vector = 2;
   optional Payload payload = 3;
-  optional uint64 version = 4; // Version of the point.
 }
 
 // Represents a point returned from a search query, including its score.
