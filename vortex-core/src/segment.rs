@@ -116,15 +116,15 @@ impl SimpleSegment {
         // So, we should pass the stem of the filename as `name`.
         let mmap_vector_storage = MmapVectorStorage::new(
             &segment_path, 
-            "segment_vectors", // Arbitrary name, files will be segment_vectors.vec, segment_vectors.del inside segment_path
+            "segment_vectors", 
             config.vector_dim,
-            1000, // Placeholder capacity
+            config.vector_storage_capacity.unwrap_or(1000) as u64, // Cast to u64
         )?;
 
         let mmap_hnsw_graph_links = MmapHnswGraphLinks::new(
             &segment_path, 
-            "segment_graph", // Arbitrary name, file will be segment_graph.hnsw inside segment_path
-            1000, // Placeholder capacity (num_nodes)
+            "segment_graph", 
+            config.graph_links_capacity.unwrap_or(1000) as u64, // Cast to u64
             0, // Initial number of layers
             u64::MAX, // Initial entry point node ID (u64::MAX means no entry point)
             config.m_max0 as u32, 
@@ -353,7 +353,7 @@ impl SimpleSegment {
         let initial_entry_point_id = self.mmap_hnsw_graph_links.get_entry_point_node_id();
         debug!(initial_entry_point_id, "In SimpleSegment::hnsw_search_internal, got entry point");
         
-        if self.mmap_vector_storage.is_empty() { // Removed ?
+        if self.mmap_vector_storage.is_empty() {
             debug!("Search called on an empty segment (vector_storage empty).");
             return Ok(Vec::new());
         }
@@ -392,12 +392,16 @@ impl SimpleSegment {
 
         let results: Vec<SearchResult> = candidates_heap.into_sorted_vec().iter().rev()
             .filter_map(|neighbor| {
-                self.reverse_vector_map.get(&neighbor.internal_id).map(|external_id| {
-                    SearchResult {
-                        id: external_id.clone(),
-                        distance: hnsw::original_score(self.distance_metric, neighbor.distance)
-                    }
-                })
+                if self.mmap_vector_storage.is_deleted(neighbor.internal_id) {
+                    None // Skip deleted vectors
+                } else {
+                    self.reverse_vector_map.get(&neighbor.internal_id).map(|external_id| {
+                        SearchResult {
+                            id: external_id.clone(),
+                            distance: hnsw::original_score(self.distance_metric, neighbor.distance)
+                        }
+                    })
+                }
             })
             .take(k).collect();
             
@@ -603,6 +607,8 @@ mod tests {
             ef_search: 10,
             ml: 0.5,
             seed: Some(123),
+            vector_storage_capacity: None,
+            graph_links_capacity: None,
         }
     }
 

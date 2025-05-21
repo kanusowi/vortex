@@ -105,6 +105,8 @@ impl CollectionsService for CollectionsServerImpl {
                 ml: params_proto.ml,
                 seed: params_proto.seed,
                 vector_dim: requested_vector_dim,
+                vector_storage_capacity: None, // Add this
+                graph_links_capacity: None,    // Add this
             }
         } else {
             let mut default_config = vortex_core::HnswConfig::default();

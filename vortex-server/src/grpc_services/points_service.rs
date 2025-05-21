@@ -775,34 +775,42 @@ impl PointsService for PointsServerImpl {
             
             let mut fetched_serde_payload: Option<serde_json::Value> = None;
             let mut result_proto_vector: Option<ProtoVector> = None;
-            let mut passes_filter = true;
+            
+            let mut passes_filter = true; // Assume passes if no filter or if filter matches.
 
-            // 1. Handle filtering and fetch payload if needed for filtering
-            if let Some(serde_filter_val) = &serde_filter_opt {
-                if let Some(payload_db) = &payload_db_arc_opt {
-                    match payload_db.get_payload(&point_id_str) {
-                        Ok(Some(payload_json_for_filter)) => {
-                            // Store the fetched payload regardless of filter outcome for potential reuse
-                            fetched_serde_payload = Some(payload_json_for_filter.clone()); 
-                            if let (Some(filter_obj_map), Some(payload_obj_map)) = (serde_filter_val.as_object(), payload_json_for_filter.as_object()) {
-                                if !filter_obj_map.is_empty() {
+            if let Some(serde_filter_val) = &serde_filter_opt { // If there is a filter
+                if serde_filter_val.as_object().map_or(false, |obj| obj.is_empty()) {
+                    // Filter is present but is an empty JSON object {}
+                    passes_filter = true;
+                } else {
+                    // Filter is present and non-empty, or not an object (which means it won't match if non-empty)
+                    passes_filter = false; // Default to not passing if filter is present and non-empty
+                    if let Some(payload_db) = &payload_db_arc_opt {
+                        match payload_db.get_payload(&point_id_str) {
+                            Ok(Some(payload_json_for_filter)) => {
+                                fetched_serde_payload = Some(payload_json_for_filter.clone());
+                                if let (Some(filter_obj_map), Some(payload_obj_map)) = 
+                                    (serde_filter_val.as_object(), payload_json_for_filter.as_object()) 
+                                {
+                                    // We already established filter_obj_map is not empty here if we reach this point
+                                    // and serde_filter_val was an object.
                                     passes_filter = crate::handlers::matches_filter(payload_obj_map, filter_obj_map);
                                 }
-                            } else { 
-                                passes_filter = serde_filter_val.as_object().map_or(true, |obj| obj.is_empty());
+                                // If payload_json_for_filter or serde_filter_val is not an object, passes_filter remains false.
+                            }
+                            Ok(None) => {
+                                // No payload for point, so it cannot match a non-empty filter.
+                                // passes_filter remains false.
+                            }
+                            Err(e) => {
+                                warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to get payload from RocksDB for search result filtering. Assuming filter mismatch.");
+                                // passes_filter remains false.
                             }
                         }
-                        Ok(None) => { // No payload for point
-                            passes_filter = serde_filter_val.as_object().map_or(true, |obj| obj.is_empty());
-                        }
-                        Err(e) => {
-                            warn!(collection_name = %req_inner.collection_name, point_id = %point_id_str, error = ?e, "Failed to get payload from RocksDB for search result filtering. Assuming filter mismatch.");
-                            passes_filter = false;
-                        }
+                    } else {
+                        warn!(collection_name = %req_inner.collection_name, "Filter requested but PayloadIndexRocksDB not found. Assuming filter mismatch for all points.");
+                        // passes_filter remains false (unless filter was empty object, handled above).
                     }
-                } else { 
-                    warn!(collection_name = %req_inner.collection_name, "Filter requested but PayloadIndexRocksDB not found. Assuming filter mismatch for all points.");
-                    passes_filter = serde_filter_val.as_object().map_or(true, |obj| obj.is_empty());
                 }
             }
 

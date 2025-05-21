@@ -18,8 +18,9 @@ use vortex_server::persistence;
 use vortex_server::grpc_api::vortex_api_v1::{
     collections_service_server::CollectionsServiceServer,
     points_service_server::PointsServiceServer,
+    snapshots_service_server::SnapshotsServiceServer, // Added
 };
-use vortex_server::grpc_services::{CollectionsServerImpl, PointsServerImpl};
+use vortex_server::grpc_services::{CollectionsServerImpl, PointsServerImpl, SnapshotsServerImpl}; // Added SnapshotsServerImpl
 use tonic::transport::Server as TonicServer;
 // Note: The original `use state::AppState;` is now covered by `use vortex_server::state::AppState;`
 
@@ -95,13 +96,15 @@ async fn main() {
 
     // Create gRPC service implementations
     let collections_service = CollectionsServerImpl { app_state: app_state_for_grpc.clone() };
-    let points_service = PointsServerImpl { app_state: app_state_for_grpc };
+    let points_service = PointsServerImpl { app_state: app_state_for_grpc.clone() }; // Clone app_state
+    let snapshots_service = SnapshotsServerImpl { app_state: app_state_for_grpc }; // Use the last clone
 
     // Spawn gRPC server in a separate Tokio task
     let grpc_server_handle = tokio::spawn(async move {
         TonicServer::builder()
             .add_service(CollectionsServiceServer::new(collections_service))
             .add_service(PointsServiceServer::new(points_service))
+            .add_service(SnapshotsServiceServer::new(snapshots_service)) // Added SnapshotsService
             .serve(grpc_addr)
             .await
             .expect("Failed to start gRPC server");

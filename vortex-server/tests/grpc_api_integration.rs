@@ -11,20 +11,24 @@ use tokio_stream::wrappers::TcpListenerStream;
 use vortex_server::state::AppState;
 use vortex_server::grpc_api::vortex_api_v1::collections_service_client::CollectionsServiceClient;
 use vortex_server::grpc_api::vortex_api_v1::points_service_client::PointsServiceClient;
+use vortex_server::grpc_api::vortex_api_v1::snapshots_service_client::SnapshotsServiceClient; // Added SnapshotsServiceClient
 use vortex_server::grpc_api::vortex_api_v1::{
     CreateCollectionRequest, DeleteCollectionRequest, DistanceMetric,
     GetCollectionInfoRequest, HnswConfigParams, ListCollectionsRequest, PointStruct,
     SearchPointsRequest, UpsertPointsRequest, Vector, GetPointsRequest,
-    DeletePointsRequest as GrpcDeletePointsRequest, // Renamed to avoid conflict
-    /*ScoredPoint, Filter,*/ SearchParams, Payload, // Commented out unused Filter, ScoredPoint
-    // CollectionExistsRequest is not a message, this check is done via GetCollectionInfo
+    DeletePointsRequest as GrpcDeletePointsRequest, 
+    SearchParams, Payload,
+    // Snapshot service types
+    CreateCollectionSnapshotRequest, RestoreCollectionSnapshotRequest,
+    ListCollectionSnapshotsRequest, DeleteCollectionSnapshotRequest,
 };
-use vortex_server::grpc_services::{CollectionsServerImpl, PointsServerImpl, points_service}; // Added points_service here
+use vortex_server::grpc_services::{CollectionsServerImpl, PointsServerImpl, SnapshotsServerImpl, points_service}; // Added SnapshotsServerImpl
 
 async fn setup_test_server() -> Result<
     (
         CollectionsServiceClient<Channel>,
         PointsServiceClient<Channel>,
+        SnapshotsServiceClient<Channel>, // Added SnapshotsServiceClient to tuple
         SocketAddr,
         tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     ),
@@ -33,15 +37,20 @@ async fn setup_test_server() -> Result<
     let data_path = tempfile::tempdir()?.path().to_path_buf();
     info!("Test server data path: {:?}", data_path);
 
-    let app_state_instance = AppState::new(data_path.clone()); // Direct assignment
+    let app_state_instance = AppState::new(data_path.clone());
     let app_state = Arc::new(RwLock::new(app_state_instance));
 
-    let app_state_for_server = app_state.clone();
+    let app_state_for_collections = app_state.clone();
+    let app_state_for_points = app_state.clone();
+    let app_state_for_snapshots = app_state.clone();
+
 
     let collections_service_impl =
-        CollectionsServerImpl { app_state: app_state_for_server.clone() };
+        CollectionsServerImpl { app_state: app_state_for_collections };
     let points_service_impl =
-        PointsServerImpl { app_state: app_state_for_server };
+        PointsServerImpl { app_state: app_state_for_points };
+    let snapshots_service_impl = // Added SnapshotsServerImpl instantiation
+        SnapshotsServerImpl { app_state: app_state_for_snapshots };
 
     let addr: SocketAddr = "127.0.0.1:0".parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -62,6 +71,11 @@ async fn setup_test_server() -> Result<
                     points_service_impl,
                 ),
             )
+            .add_service( // Added SnapshotsService to the server
+                vortex_server::grpc_api::vortex_api_v1::snapshots_service_server::SnapshotsServiceServer::new(
+                    snapshots_service_impl,
+                ),
+            )
             .serve_with_incoming_shutdown(listener_stream, async {
                 tokio::signal::ctrl_c().await.unwrap();
                 info!("gRPC server shutting down");
@@ -73,11 +87,13 @@ async fn setup_test_server() -> Result<
 
     let endpoint_uri = format!("http://{}", actual_addr);
     let collections_client = CollectionsServiceClient::connect(endpoint_uri.clone()).await?;
-    let points_client = PointsServiceClient::connect(endpoint_uri).await?;
+    let points_client = PointsServiceClient::connect(endpoint_uri.clone()).await?;
+    let snapshots_client = SnapshotsServiceClient::connect(endpoint_uri).await?; // Added SnapshotsServiceClient connection
 
     Ok((
         collections_client,
         points_client,
+        snapshots_client, // Added snapshots_client to returned tuple
         actual_addr,
         server_handle,
     ))
@@ -86,7 +102,7 @@ async fn setup_test_server() -> Result<
 #[tokio::test]
 async fn test_grpc_server_starts_and_basic_ping() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, _points_client, _addr, server_handle) =
+    let (mut collections_client, _points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let request = tonic::Request::new(ListCollectionsRequest {});
@@ -98,9 +114,768 @@ async fn test_grpc_server_starts_and_basic_ping() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
+async fn test_points_service_payload_filtering_comprehensive() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (mut collections_client, mut points_client, _snapshots_client, _addr, server_handle) =
+        setup_test_server().await?;
+
+    let collection_name = "payload_filter_test_coll".to_string();
+    let vector_dims = 2;
+
+    // 1. Create Collection
+    collections_client
+        .create_collection(tonic::Request::new(CreateCollectionRequest {
+            collection_name: collection_name.clone(),
+            vector_dimensions: vector_dims,
+            distance_metric: DistanceMetric::Cosine as i32,
+            hnsw_config: Some(HnswConfigParams {
+                m: 8, ef_construction: 50, ef_search: 20, ml: 0.3, seed: None, vector_dim: vector_dims, m_max0: 16,
+            }),
+        }))
+        .await?;
+    info!("Collection {} created for comprehensive payload filtering test", collection_name);
+
+    // 2. Prepare and Upsert Points with diverse payloads
+    let points_to_upsert = vec![
+        PointStruct { // P1
+            id: "p1_filter".to_string(),
+            vector: Some(Vector { elements: vec![0.1, 0.1] }), // Closest to query_target_p1
+            payload: Some(Payload {
+                fields: [
+                    ("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("A".to_string())) }),
+                    ("count".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(10.0)) }),
+                    ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) }),
+                    ("category".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("X".to_string())) }),
+                ].into_iter().collect(),
+            }),
+            version: None,
+        },
+        PointStruct { // P2
+            id: "p2_filter".to_string(),
+            vector: Some(Vector { elements: vec![0.2, 0.2] }), // Second closest
+            payload: Some(Payload {
+                fields: [
+                    ("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("B".to_string())) }),
+                    ("count".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(20.0)) }),
+                    ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(false)) }),
+                    ("category".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("X".to_string())) }),
+                ].into_iter().collect(),
+            }),
+            version: None,
+        },
+        PointStruct { // P3
+            id: "p3_filter".to_string(),
+            vector: Some(Vector { elements: vec![0.8, 0.8] }), // Furthest from query_target_p1, but matches some filters
+            payload: Some(Payload {
+                fields: [
+                    ("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("A".to_string())) }),
+                    ("count".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(10.0)) }),
+                    ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) }),
+                    ("category".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("Y".to_string())) }),
+                ].into_iter().collect(),
+            }),
+            version: None,
+        },
+        PointStruct { // P4
+            id: "p4_filter".to_string(),
+            vector: Some(Vector { elements: vec![0.3, 0.3] }), // Third closest
+            payload: Some(Payload {
+                fields: [
+                    ("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("C".to_string())) }),
+                    ("count".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(30.0)) }),
+                    ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) }),
+                    ("category".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("Y".to_string())) }),
+                    ("extra_field".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("extra_value".to_string())) }),
+                ].into_iter().collect(),
+            }),
+            version: None,
+        },
+        PointStruct { // P5: Missing 'active' and 'category'
+            id: "p5_filter_partial_payload".to_string(),
+            vector: Some(Vector { elements: vec![0.15, 0.15] }), // Very close to query_target_p1
+            payload: Some(Payload {
+                fields: [
+                    ("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("A".to_string())) }),
+                    ("count".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(20.0)) }),
+                ].into_iter().collect(),
+            }),
+            version: None,
+        },
+        PointStruct { // P6: No payload
+            id: "p6_filter_no_payload".to_string(),
+            vector: Some(Vector { elements: vec![0.9, 0.9] }),
+            payload: None,
+            version: None,
+        },
+    ];
+
+    points_client
+        .upsert_points(tonic::Request::new(UpsertPointsRequest {
+            collection_name: collection_name.clone(),
+            points: points_to_upsert.clone(),
+            wait_flush: Some(true),
+        }))
+        .await?;
+    info!("Upserted 6 points with diverse payloads for filtering test");
+
+    let query_target_p1 = Vector { elements: vec![0.1, 0.1] }; // Closest to p1_filter and p5_filter_partial_payload
+
+    // 3. Test scenarios
+    // Scenario 3.1: Single exact match (string) - should find p1, p3, p5
+    let filter_tag_a = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("A".to_string())) })].into_iter().collect(),
+    });
+    let search_resp_tag_a = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()),
+        k_limit: 5, filter: filter_tag_a, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    assert_eq!(search_resp_tag_a.results.len(), 3);
+    assert!(search_resp_tag_a.results.iter().any(|p| p.id == "p1_filter"));
+    assert!(search_resp_tag_a.results.iter().any(|p| p.id == "p3_filter"));
+    assert!(search_resp_tag_a.results.iter().any(|p| p.id == "p5_filter_partial_payload"));
+    info!("Verified filter by tag='A'");
+
+    // Scenario 3.2: Single exact match (number) - should find p1, p3
+    let filter_count_10 = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [("count".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(10.0)) })].into_iter().collect(),
+    });
+    let search_resp_count_10 = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()),
+        k_limit: 5, filter: filter_count_10, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    assert_eq!(search_resp_count_10.results.len(), 2);
+    assert!(search_resp_count_10.results.iter().any(|p| p.id == "p1_filter"));
+    assert!(search_resp_count_10.results.iter().any(|p| p.id == "p3_filter"));
+    info!("Verified filter by count=10");
+
+    // Scenario 3.3: Single exact match (boolean) - should find p1, p3, p4
+    let filter_active_true = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) })].into_iter().collect(),
+    });
+    let search_resp_active_true = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()),
+        k_limit: 5, filter: filter_active_true, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    assert_eq!(search_resp_active_true.results.len(), 3);
+    assert!(search_resp_active_true.results.iter().any(|p| p.id == "p1_filter"));
+    assert!(search_resp_active_true.results.iter().any(|p| p.id == "p3_filter"));
+    assert!(search_resp_active_true.results.iter().any(|p| p.id == "p4_filter"));
+    info!("Verified filter by active=true");
+
+    // Scenario 3.4: Multiple exact matches (implicit AND) - tag='A' AND count=10 - should find p1, p3
+    let filter_tag_a_count_10 = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [
+            ("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("A".to_string())) }),
+            ("count".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::NumberValue(10.0)) }),
+        ].into_iter().collect(),
+    });
+    let search_resp_tag_a_count_10 = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()),
+        k_limit: 5, filter: filter_tag_a_count_10, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    assert_eq!(search_resp_tag_a_count_10.results.len(), 2);
+    assert!(search_resp_tag_a_count_10.results.iter().any(|p| p.id == "p1_filter"));
+    assert!(search_resp_tag_a_count_10.results.iter().any(|p| p.id == "p3_filter"));
+    info!("Verified filter by tag='A' AND count=10");
+
+    // Scenario 3.5: Multiple exact matches - tag='A' AND active=true AND category='X' - should find p1
+    let filter_p1_specific = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [
+            ("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("A".to_string())) }),
+            ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) }),
+            ("category".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("X".to_string())) }),
+        ].into_iter().collect(),
+    });
+    let search_resp_p1_specific = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()),
+        k_limit: 5, filter: filter_p1_specific, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    assert_eq!(search_resp_p1_specific.results.len(), 1);
+    assert_eq!(search_resp_p1_specific.results[0].id, "p1_filter");
+    info!("Verified filter specific to p1_filter");
+
+    // Scenario 3.6: Filter matching no points
+    let filter_no_match = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("NonExistentTag".to_string())) })].into_iter().collect(),
+    });
+    let search_resp_no_match = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()),
+        k_limit: 5, filter: filter_no_match, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    assert!(search_resp_no_match.results.is_empty());
+    info!("Verified filter matching no points");
+
+    // Scenario 3.7: Filter overrides vector similarity - p3 is far, but matches filter; p5 is close but doesn't match full filter
+    // Filter: category='Y' AND active=true. This matches p3 and p4. p1 and p5 are closer to query_target_p1 but don't match.
+    let filter_cat_y_active_true = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [
+            ("category".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("Y".to_string())) }),
+            ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) }),
+        ].into_iter().collect(),
+    });
+    let search_resp_override_similarity = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()), // query_target_p1 is closest to p1 and p5
+        k_limit: 1, filter: filter_cat_y_active_true, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    assert_eq!(search_resp_override_similarity.results.len(), 1);
+    // p4_filter (vector [0.3, 0.3]) is closer to query_target_p1 ([0.1,0.1]) than p3_filter ([0.8,0.8])
+    // Both p3 and p4 match the filter. The one closer to the query vector among them should be returned.
+    assert_eq!(search_resp_override_similarity.results[0].id, "p4_filter"); 
+    info!("Verified filter overrides pure vector similarity (p4 selected over p3 due to vector, p1/p5 excluded by filter)");
+
+    // Scenario 3.8: Filter on a field not present in some points (e.g., 'extra_field' only in p4)
+    let filter_extra_field = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [("extra_field".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("extra_value".to_string())) })].into_iter().collect(),
+    });
+    let search_resp_extra_field = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()),
+        k_limit: 5, filter: filter_extra_field, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    assert_eq!(search_resp_extra_field.results.len(), 1);
+    assert_eq!(search_resp_extra_field.results[0].id, "p4_filter");
+    info!("Verified filter on field present in only one point");
+    
+    // Scenario 3.9: Filter that would match a point with no payload (p6) - should not match
+    // (This is implicitly tested as p6 has no fields to match any filter condition)
+    // For example, filter by tag='A'. p6 has no tag, so it won't be returned.
+
+    // Scenario 3.10: Filter on a field that is missing from a point that would otherwise be a good match
+    // p5 is close to query_target_p1, has tag='A'. Filter for tag='A' AND active=true. p5 has no 'active' field.
+    let filter_tag_a_active_true = Some(vortex_server::grpc_api::vortex_api_v1::Filter {
+        must_match_exact: [
+            ("tag".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::StringValue("A".to_string())) }),
+            ("active".to_string(), prost_types::Value { kind: Some(prost_types::value::Kind::BoolValue(true)) }),
+        ].into_iter().collect(),
+    });
+    let search_resp_tag_a_active_true = points_client.search_points(tonic::Request::new(SearchPointsRequest {
+        collection_name: collection_name.clone(),
+        query_vector: Some(query_target_p1.clone()),
+        k_limit: 5, filter: filter_tag_a_active_true, with_payload: Some(true), with_vector: Some(false), params: None,
+    })).await?.into_inner();
+    // Expected: p1_filter, p3_filter. p5_filter_partial_payload should NOT be here because it's missing 'active' field.
+    assert_eq!(search_resp_tag_a_active_true.results.len(), 2);
+    assert!(search_resp_tag_a_active_true.results.iter().any(|p| p.id == "p1_filter"));
+    assert!(search_resp_tag_a_active_true.results.iter().any(|p| p.id == "p3_filter"));
+    assert!(!search_resp_tag_a_active_true.results.iter().any(|p| p.id == "p5_filter_partial_payload"));
+    info!("Verified filter on field missing in a close candidate (p5 excluded)");
+
+
+    // Clean up
+    collections_client
+        .delete_collection(tonic::Request::new(DeleteCollectionRequest {
+            collection_name: collection_name.clone(),
+        }))
+        .await?;
+    info!("Cleaned up collection {}", collection_name);
+
+    server_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_snapshot_lifecycle_with_provided_name() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (
+        mut collections_client,
+        mut points_client,
+        mut snapshots_client,
+        _addr,
+        server_handle,
+    ) = setup_test_server().await?;
+
+    let collection_name = "snap_test_coll_prov_name".to_string();
+    let provided_snapshot_name = "my_custom_snapshot_1".to_string();
+    let restored_collection_name = "snap_test_coll_prov_name_restored".to_string();
+    let vector_dims = 2;
+
+    // 1. Create Collection
+    collections_client
+        .create_collection(tonic::Request::new(CreateCollectionRequest {
+            collection_name: collection_name.clone(),
+            vector_dimensions: vector_dims,
+            distance_metric: DistanceMetric::Cosine as i32,
+            hnsw_config: None,
+        }))
+        .await?;
+    info!("Collection {} created", collection_name);
+
+    // 2. Upsert points
+    let points = vec![
+        PointStruct {
+            id: "px1".to_string(),
+            vector: Some(Vector { elements: vec![0.5, 0.6] }),
+            payload: None,
+            version: None,
+        },
+    ];
+    points_client
+        .upsert_points(tonic::Request::new(UpsertPointsRequest {
+            collection_name: collection_name.clone(),
+            points: points.clone(),
+            wait_flush: Some(true),
+        }))
+        .await?;
+    info!("Upserted 1 point into {}", collection_name);
+
+    // 3. Create Snapshot (provided name)
+    let create_snapshot_resp = snapshots_client
+        .create_collection_snapshot(tonic::Request::new(CreateCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: Some(provided_snapshot_name.clone()), // Provide name
+            wait_flush: Some(true),
+        }))
+        .await?
+        .into_inner();
+    
+    assert!(create_snapshot_resp.status.is_some());
+    let status_code_val = create_snapshot_resp.status.as_ref().unwrap().status_code;
+    assert_eq!(status_code_val, vortex_server::grpc_api::vortex_api_v1::StatusCode::Ok as i32, "Create snapshot status was not OK: {:?}", create_snapshot_resp.status);
+    
+    assert!(create_snapshot_resp.snapshot_description.is_some());
+    let snapshot_desc = create_snapshot_resp.snapshot_description.unwrap();
+    assert_eq!(snapshot_desc.collection_name, collection_name);
+    assert_eq!(snapshot_desc.snapshot_name, provided_snapshot_name); // Name should be the one provided
+    assert!(snapshot_desc.size_bytes > 0);
+    info!("Snapshot {} created for collection {}", provided_snapshot_name, collection_name);
+
+    // 4. List Snapshots
+    let list_snapshots_resp = snapshots_client
+        .list_collection_snapshots(tonic::Request::new(ListCollectionSnapshotsRequest {
+            collection_name: collection_name.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(list_snapshots_resp.snapshots.len(), 1);
+    assert_eq!(list_snapshots_resp.snapshots[0].snapshot_name, provided_snapshot_name);
+    info!("Verified snapshot {} is listed", provided_snapshot_name);
+
+    // 5. Restore Snapshot
+    snapshots_client
+        .restore_collection_snapshot(tonic::Request::new(RestoreCollectionSnapshotRequest {
+            target_collection_name: restored_collection_name.clone(),
+            snapshot_name: provided_snapshot_name.clone(),
+            source_collection_name: collection_name.clone(),
+        }))
+        .await?;
+    info!("Restored snapshot {} to collection {}", provided_snapshot_name, restored_collection_name);
+
+    // 6. Verify restored data
+    let get_points_resp = points_client
+        .get_points(tonic::Request::new(GetPointsRequest {
+            collection_name: restored_collection_name.clone(),
+            ids: vec!["px1".to_string()],
+            with_vector: Some(false),
+            with_payload: Some(false),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(get_points_resp.points.len(), 1);
+
+    // 7. Delete Snapshot
+    snapshots_client
+        .delete_collection_snapshot(tonic::Request::new(DeleteCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: provided_snapshot_name.clone(),
+        }))
+        .await?;
+    info!("Deleted snapshot {}", provided_snapshot_name);
+    
+    // Clean up
+    collections_client.delete_collection(tonic::Request::new(DeleteCollectionRequest { collection_name: collection_name.clone() })).await?;
+    collections_client.delete_collection(tonic::Request::new(DeleteCollectionRequest { collection_name: restored_collection_name.clone() })).await?;
+        
+    server_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_multiple_snapshots() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (
+        mut collections_client,
+        _points_client, // Not used directly, but setup needs it
+        mut snapshots_client,
+        _addr,
+        server_handle,
+    ) = setup_test_server().await?;
+
+    let collection_name = "list_multi_snap_coll".to_string();
+    let vector_dims = 2;
+
+    // 1. Create Collection
+    collections_client
+        .create_collection(tonic::Request::new(CreateCollectionRequest {
+            collection_name: collection_name.clone(),
+            vector_dimensions: vector_dims,
+            distance_metric: DistanceMetric::Cosine as i32,
+            hnsw_config: None,
+        }))
+        .await?;
+    info!("Collection {} created", collection_name);
+
+    // 2. Create Snapshot 1 (generated name)
+    let create_snap1_resp = snapshots_client
+        .create_collection_snapshot(tonic::Request::new(CreateCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: None,
+            wait_flush: Some(true),
+        }))
+        .await?
+        .into_inner();
+    let snap1_name = create_snap1_resp.snapshot_description.unwrap().snapshot_name;
+    info!("Created snapshot 1: {}", snap1_name);
+    
+    // Ensure some time passes for a different timestamp-based name if generated
+    sleep(Duration::from_secs(1)).await;
+
+
+    // 3. Create Snapshot 2 (provided name)
+    let snap2_name = "my_second_snapshot".to_string();
+    let create_snap2_resp = snapshots_client
+        .create_collection_snapshot(tonic::Request::new(CreateCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: Some(snap2_name.clone()),
+            wait_flush: Some(true),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(create_snap2_resp.snapshot_description.unwrap().snapshot_name, snap2_name);
+    info!("Created snapshot 2: {}", snap2_name);
+    
+    sleep(Duration::from_secs(1)).await;
+
+    // 4. Create Snapshot 3 (another generated name)
+     let create_snap3_resp = snapshots_client
+        .create_collection_snapshot(tonic::Request::new(CreateCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: None,
+            wait_flush: Some(true),
+        }))
+        .await?
+        .into_inner();
+    let snap3_name = create_snap3_resp.snapshot_description.unwrap().snapshot_name;
+    info!("Created snapshot 3: {}", snap3_name);
+
+
+    // 5. List Snapshots
+    let list_resp = snapshots_client
+        .list_collection_snapshots(tonic::Request::new(ListCollectionSnapshotsRequest {
+            collection_name: collection_name.clone(),
+        }))
+        .await?
+        .into_inner();
+    
+    assert_eq!(list_resp.snapshots.len(), 3, "Expected 3 snapshots to be listed");
+    assert!(list_resp.snapshots.iter().any(|s| s.snapshot_name == snap1_name));
+    assert!(list_resp.snapshots.iter().any(|s| s.snapshot_name == snap2_name));
+    assert!(list_resp.snapshots.iter().any(|s| s.snapshot_name == snap3_name));
+    info!("Verified all 3 snapshots are listed");
+
+    // Clean up
+    snapshots_client.delete_collection_snapshot(tonic::Request::new(DeleteCollectionSnapshotRequest { collection_name: collection_name.clone(), snapshot_name: snap1_name })).await?;
+    snapshots_client.delete_collection_snapshot(tonic::Request::new(DeleteCollectionSnapshotRequest { collection_name: collection_name.clone(), snapshot_name: snap2_name })).await?;
+    snapshots_client.delete_collection_snapshot(tonic::Request::new(DeleteCollectionSnapshotRequest { collection_name: collection_name.clone(), snapshot_name: snap3_name })).await?;
+    collections_client.delete_collection(tonic::Request::new(DeleteCollectionRequest { collection_name: collection_name.clone() })).await?;
+        
+    server_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_snapshot_error_cases() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (
+        mut collections_client,
+        _points_client,
+        mut snapshots_client,
+        _addr,
+        server_handle,
+    ) = setup_test_server().await?;
+
+    let collection_name = "snap_error_coll".to_string();
+    let non_existent_collection = "no_such_coll_snap_test".to_string();
+    let snapshot_name = "test_snap_errors".to_string();
+
+    // 1. Create snapshot for non-existent collection
+    let create_non_existent_coll_resp = snapshots_client
+        .create_collection_snapshot(tonic::Request::new(CreateCollectionSnapshotRequest {
+            collection_name: non_existent_collection.clone(),
+            snapshot_name: None,
+            wait_flush: Some(true),
+        }))
+        .await;
+    assert!(create_non_existent_coll_resp.is_err());
+    if let Err(status) = create_non_existent_coll_resp {
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+    info!("Verified create snapshot for non-existent collection fails");
+
+    // Setup a collection for other tests
+    collections_client
+        .create_collection(tonic::Request::new(CreateCollectionRequest {
+            collection_name: collection_name.clone(),
+            vector_dimensions: 2,
+            distance_metric: DistanceMetric::Cosine as i32,
+            hnsw_config: None,
+        }))
+        .await?;
+
+    // 2. Create snapshot with a name, then try to create again with the same name
+    snapshots_client
+        .create_collection_snapshot(tonic::Request::new(CreateCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: Some(snapshot_name.clone()),
+            wait_flush: Some(true),
+        }))
+        .await?;
+    
+    let create_duplicate_resp = snapshots_client
+        .create_collection_snapshot(tonic::Request::new(CreateCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: Some(snapshot_name.clone()),
+            wait_flush: Some(true),
+        }))
+        .await;
+    assert!(create_duplicate_resp.is_err());
+    if let Err(status) = create_duplicate_resp {
+        // Expecting Internal because ServerError::CoreError(VortexError::Configuration) maps to Internal
+        assert_eq!(status.code(), tonic::Code::Internal, "Expected Internal for duplicate snapshot, got: {:?}", status);
+        assert!(status.message().contains("Specific snapshot directory"));
+        assert!(status.message().contains("already exists"));
+    }
+    info!("Verified create duplicate snapshot name fails");
+
+    // 3. List snapshots for a non-existent collection (should be empty)
+    let list_non_existent_resp = snapshots_client
+        .list_collection_snapshots(tonic::Request::new(ListCollectionSnapshotsRequest {
+            collection_name: non_existent_collection.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert!(list_non_existent_resp.snapshots.is_empty());
+    info!("Verified list snapshots for non-existent collection is empty");
+
+    // 4. Delete non-existent snapshot
+    let delete_non_existent_snap_resp = snapshots_client
+        .delete_collection_snapshot(tonic::Request::new(DeleteCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: "no_such_snapshot".to_string(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(delete_non_existent_snap_resp.status.unwrap().status_code, vortex_server::grpc_api::vortex_api_v1::StatusCode::NotFound as i32);
+    info!("Verified delete non-existent snapshot returns NotFound");
+    
+    // 5. Restore non-existent snapshot
+    let restore_non_existent_snap_resp = snapshots_client
+        .restore_collection_snapshot(tonic::Request::new(RestoreCollectionSnapshotRequest {
+            target_collection_name: "restore_target_coll".to_string(),
+            snapshot_name: "no_such_snapshot_for_restore".to_string(),
+            source_collection_name: collection_name.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(restore_non_existent_snap_resp.status.unwrap().status_code, vortex_server::grpc_api::vortex_api_v1::StatusCode::NotFound as i32);
+    info!("Verified restore non-existent snapshot returns NotFound");
+
+    // 6. Restore to an existing collection name
+    let existing_target_name = "existing_target_for_restore".to_string();
+    collections_client
+        .create_collection(tonic::Request::new(CreateCollectionRequest {
+            collection_name: existing_target_name.clone(),
+            vector_dimensions: 2,
+            distance_metric: DistanceMetric::Cosine as i32,
+            hnsw_config: None,
+        }))
+        .await?;
+    
+    let restore_to_existing_resp = snapshots_client
+        .restore_collection_snapshot(tonic::Request::new(RestoreCollectionSnapshotRequest {
+            target_collection_name: existing_target_name.clone(),
+            snapshot_name: snapshot_name.clone(), // Use the one created earlier
+            source_collection_name: collection_name.clone(),
+        }))
+        .await;
+    assert!(restore_to_existing_resp.is_err());
+     if let Err(status) = restore_to_existing_resp {
+        assert_eq!(status.code(), tonic::Code::Internal, "Expected Internal for restore to existing, got: {:?}", status); // ServerError::CoreError(VortexError::Configuration)
+        assert!(status.message().contains("Target collection directory"));
+        assert!(status.message().contains("already exists"));
+    }
+    info!("Verified restore to existing collection name fails");
+
+
+    // Clean up
+    snapshots_client.delete_collection_snapshot(tonic::Request::new(DeleteCollectionSnapshotRequest { collection_name: collection_name.clone(), snapshot_name: snapshot_name.clone() })).await?;
+    collections_client.delete_collection(tonic::Request::new(DeleteCollectionRequest { collection_name: collection_name.clone() })).await?;
+    collections_client.delete_collection(tonic::Request::new(DeleteCollectionRequest { collection_name: existing_target_name.clone() })).await?;
+        
+    server_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_snapshot_lifecycle_with_generated_name() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (
+        mut collections_client,
+        mut points_client,
+        mut snapshots_client,
+        _addr,
+        server_handle,
+    ) = setup_test_server().await?;
+
+    let collection_name = "snap_test_coll_gen_name".to_string();
+    let restored_collection_name = "snap_test_coll_gen_name_restored".to_string();
+    let vector_dims = 2;
+
+    // 1. Create Collection
+    collections_client
+        .create_collection(tonic::Request::new(CreateCollectionRequest {
+            collection_name: collection_name.clone(),
+            vector_dimensions: vector_dims,
+            distance_metric: DistanceMetric::Cosine as i32,
+            hnsw_config: None,
+        }))
+        .await?;
+    info!("Collection {} created", collection_name);
+
+    // 2. Upsert points
+    let points = vec![
+        PointStruct {
+            id: "p1".to_string(),
+            vector: Some(Vector { elements: vec![0.1, 0.2] }),
+            payload: None,
+            version: None,
+        },
+        PointStruct {
+            id: "p2".to_string(),
+            vector: Some(Vector { elements: vec![0.3, 0.4] }),
+            payload: None,
+            version: None,
+        },
+    ];
+    points_client
+        .upsert_points(tonic::Request::new(UpsertPointsRequest {
+            collection_name: collection_name.clone(),
+            points: points.clone(),
+            wait_flush: Some(true),
+        }))
+        .await?;
+    info!("Upserted 2 points into {}", collection_name);
+
+    // 3. Create Snapshot (generated name)
+    let create_snapshot_resp = snapshots_client
+        .create_collection_snapshot(tonic::Request::new(CreateCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: None, // Generate name
+            wait_flush: Some(true),
+        }))
+        .await?
+        .into_inner();
+    
+    assert!(create_snapshot_resp.status.is_some());
+    let status_code_val = create_snapshot_resp.status.as_ref().unwrap().status_code;
+    assert_eq!(status_code_val, vortex_server::grpc_api::vortex_api_v1::StatusCode::Ok as i32, "Create snapshot status was not OK: {:?}", create_snapshot_resp.status);
+
+
+    assert!(create_snapshot_resp.snapshot_description.is_some());
+    let snapshot_desc = create_snapshot_resp.snapshot_description.unwrap();
+    assert_eq!(snapshot_desc.collection_name, collection_name);
+    assert!(!snapshot_desc.snapshot_name.is_empty()); 
+    assert!(snapshot_desc.snapshot_name.starts_with(&format!("{}_", collection_name))); // Check generated name prefix
+    assert!(snapshot_desc.size_bytes > 0, "Snapshot size should be greater than 0. Got: {}", snapshot_desc.size_bytes); 
+    let created_snapshot_name = snapshot_desc.snapshot_name.clone();
+    info!("Snapshot {} created for collection {}", created_snapshot_name, collection_name);
+
+    // 4. List Snapshots
+    let list_snapshots_resp = snapshots_client
+        .list_collection_snapshots(tonic::Request::new(ListCollectionSnapshotsRequest {
+            collection_name: collection_name.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(list_snapshots_resp.snapshots.len(), 1, "Expected 1 snapshot to be listed");
+    assert_eq!(list_snapshots_resp.snapshots[0].snapshot_name, created_snapshot_name);
+    assert_eq!(list_snapshots_resp.snapshots[0].collection_name, collection_name);
+    info!("Verified snapshot {} is listed", created_snapshot_name);
+
+    // 5. Restore Snapshot to a new collection name
+    let restore_resp = snapshots_client
+        .restore_collection_snapshot(tonic::Request::new(RestoreCollectionSnapshotRequest {
+            target_collection_name: restored_collection_name.clone(),
+            snapshot_name: created_snapshot_name.clone(),
+            source_collection_name: collection_name.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert!(restore_resp.status.is_some());
+    assert_eq!(restore_resp.status.unwrap().status_code, vortex_server::grpc_api::vortex_api_v1::StatusCode::Ok as i32);
+    info!("Restored snapshot {} to collection {}", created_snapshot_name, restored_collection_name);
+
+    // 6. Verify restored collection data
+    let get_points_resp = points_client
+        .get_points(tonic::Request::new(GetPointsRequest {
+            collection_name: restored_collection_name.clone(),
+            ids: vec!["p1".to_string(), "p2".to_string()],
+            with_vector: Some(true),
+            with_payload: Some(false),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(get_points_resp.points.len(), 2, "Expected 2 points in restored collection");
+    // Could add more detailed checks for vector data if necessary
+
+    // 7. Delete Snapshot
+    let delete_resp = snapshots_client
+        .delete_collection_snapshot(tonic::Request::new(DeleteCollectionSnapshotRequest {
+            collection_name: collection_name.clone(),
+            snapshot_name: created_snapshot_name.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert!(delete_resp.status.is_some());
+    assert_eq!(delete_resp.status.unwrap().status_code, vortex_server::grpc_api::vortex_api_v1::StatusCode::Ok as i32);
+    info!("Deleted snapshot {}", created_snapshot_name);
+
+    // 8. List Snapshots again
+    let list_after_delete_resp = snapshots_client
+        .list_collection_snapshots(tonic::Request::new(ListCollectionSnapshotsRequest {
+            collection_name: collection_name.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert!(list_after_delete_resp.snapshots.is_empty(), "Snapshot list should be empty after deletion");
+    info!("Verified snapshot {} is no longer listed", created_snapshot_name);
+
+    // Clean up collections
+    collections_client
+        .delete_collection(tonic::Request::new(DeleteCollectionRequest {
+            collection_name: collection_name.clone(),
+        }))
+        .await?;
+    collections_client
+        .delete_collection(tonic::Request::new(DeleteCollectionRequest {
+            collection_name: restored_collection_name.clone(),
+        }))
+        .await?;
+        
+    server_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_points_service_payload_types() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, mut points_client, _addr, server_handle) =
+    let (mut collections_client, mut points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name_str = "test_payload_types_collection".to_string();
@@ -260,7 +1035,7 @@ async fn test_points_service_payload_types() -> Result<(), Box<dyn std::error::E
 #[tokio::test]
 async fn test_points_service_versioning() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, mut points_client, _addr, server_handle) =
+    let (mut collections_client, mut points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name_str = "test_versioning_collection".to_string();
@@ -491,7 +1266,7 @@ async fn test_points_service_versioning() -> Result<(), Box<dyn std::error::Erro
 #[tokio::test]
 async fn test_points_service_wait_flush_operations() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, mut points_client, _addr, server_handle) =
+    let (mut collections_client, mut points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name_str = "test_wait_flush_collection".to_string();
@@ -609,7 +1384,7 @@ async fn test_points_service_wait_flush_operations() -> Result<(), Box<dyn std::
 #[tokio::test]
 async fn test_points_service_error_cases() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, mut points_client, _addr, server_handle) =
+    let (mut collections_client, mut points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name_ok = "points_errors_collection_ok".to_string();
@@ -893,7 +1668,7 @@ async fn test_points_service_error_cases() -> Result<(), Box<dyn std::error::Err
 #[tokio::test]
 async fn test_search_points_edge_cases() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, mut points_client, _addr, server_handle) =
+    let (mut collections_client, mut points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name = "search_edges_collection".to_string();
@@ -979,7 +1754,7 @@ async fn test_search_points_edge_cases() -> Result<(), Box<dyn std::error::Error
 #[tokio::test]
 async fn test_collections_service_error_cases() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, _points_client, _addr, server_handle) =
+    let (mut collections_client, _points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name_str = "test_collection_errors".to_string();
@@ -1162,7 +1937,7 @@ async fn test_collections_service_error_cases() -> Result<(), Box<dyn std::error
 #[tokio::test]
 async fn test_collections_service_create_with_default_hnsw_config() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, _points_client, _addr, server_handle) =
+    let (mut collections_client, _points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name = "test_default_hnsw_coll".to_string();
@@ -1212,7 +1987,7 @@ async fn test_collections_service_create_with_default_hnsw_config() -> Result<()
 #[tokio::test]
 async fn test_collections_service_varied_hnsw_params() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, _points_client, _addr, server_handle) =
+    let (mut collections_client, _points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name_1 = "test_varied_hnsw_1".to_string();
@@ -1288,7 +2063,7 @@ async fn test_collections_service_varied_hnsw_params() -> Result<(), Box<dyn std
 #[tokio::test]
 async fn test_collections_service_crud_operations() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, mut points_client, _addr, server_handle) = // Added points_client
+    let (mut collections_client, mut points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name_str = "test_collection_crud".to_string();
@@ -1415,7 +2190,7 @@ async fn test_collections_service_crud_operations() -> Result<(), Box<dyn std::e
 #[tokio::test]
 async fn test_points_service_operations() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
-    let (mut collections_client, mut points_client, _addr, server_handle) =
+    let (mut collections_client, mut points_client, _snapshots_client, _addr, server_handle) = // Added _snapshots_client
         setup_test_server().await?;
 
     let collection_name_str = "test_points_collection".to_string();

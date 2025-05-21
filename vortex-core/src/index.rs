@@ -10,8 +10,10 @@ use crate::vector::{Embedding, VectorId};
 // use crate::storage::mmap_vector_storage::MmapVectorStorage; // Unused
 // use crate::storage::mmap_hnsw_graph_links::MmapHnswGraphLinks; // Unused
 use crate::segment::{Segment, SimpleSegment}; // Added segment imports
+use crate::hnsw::SearchResult as SegmentSearchResult; // Use hnsw::SearchResult directly
 use std::sync::Arc; // Added Arc
 use tokio::sync::RwLock; // Added RwLock
+use futures::future::try_join_all; // Added for parallel segment search
 
 use async_trait::async_trait;
 // ndarray::ArrayView1 removed
@@ -163,14 +165,72 @@ impl HnswIndex {
         };
         
         // Save initial index metadata (which might just point to segment 0 for now)
-        new_index.save_index_metadata()?;
+        new_index.save_index_metadata_async().await?;
 
         Ok(new_index)
     }
 
+    /// Adds a new empty segment to the index. For testing multi-segment scenarios.
+    // #[cfg(test)] // Removed to make it available for benchmarks
+    pub async fn add_new_segment_for_testing(&mut self) -> VortexResult<usize> {
+        let new_segment_id = self.segments.len();
+        let segment_path = get_segment_path(&self.path, new_segment_id);
+        
+        info!(path=?segment_path, "Creating new segment for testing in HnswIndex");
+        
+        // Use the HnswIndex's overall config and metric for the new segment
+        let mut new_segment = SimpleSegment::new(segment_path, self.config, self.metric).await?;
+        new_segment.save().await?; // Save the newly created segment
+        
+        self.segments.push(Arc::new(RwLock::new(new_segment)));
+        
+        // Re-save index metadata to include the new segment
+        self.save_index_metadata_async().await?;
+        
+        Ok(new_segment_id)
+    }
+    
     /// Returns the number of segments in the index.
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+    
+    async fn save_index_metadata_async(&self) -> VortexResult<()> {
+        let metadata_path = get_metadata_path(&self.path);
+        let temp_metadata_path = metadata_path.with_extension("tmp_idx_meta.json");
+
+        #[derive(Serialize)]
+        struct IndexFileMetadata<'a> {
+            config: &'a HnswConfig,
+            metric: &'a DistanceMetric,
+            segment_dir_names: Vec<String>,
+        }
+
+        let mut segment_dir_names = Vec::new();
+        for s_arc in &self.segments {
+            let s_guard = s_arc.read().await;
+            if let Some(dir_name) = s_guard.path().file_name().and_then(|os_str| os_str.to_str()) {
+                segment_dir_names.push(dir_name.to_string());
+            } else {
+                warn!("Could not get directory name for segment path: {:?}", s_guard.path());
+                // Optionally, return an error if a segment path is invalid or cannot be processed
+                // return Err(VortexError::StorageError(format!("Invalid segment path: {:?}", s_guard.path())));
+            }
+        }
+        
+        let metadata_content = IndexFileMetadata {
+            config: &self.config,
+            metric: &self.metric,
+            segment_dir_names,
+        };
+        
+        let file = fs::File::create(&temp_metadata_path).map_err(|e| VortexError::IoError { path: temp_metadata_path.clone(), source: e })?;
+        serde_json::to_writer_pretty(file, &metadata_content)
+            .map_err(|e| VortexError::StorageError(format!("Failed to serialize HNSWIndex metadata: {}", e)))?;
+        
+        fs::rename(&temp_metadata_path, &metadata_path).map_err(|e| VortexError::IoError { path: temp_metadata_path.clone(), source: e })?;
+        debug!("Successfully saved HNSW index-level metadata to {:?}", metadata_path);
+        Ok(())
     }
 
     /// Opens an existing HNSW index, loading its segments.
@@ -188,74 +248,68 @@ impl HnswIndex {
         }
 
         let metadata_path = get_metadata_path(&index_path);
-        let (loaded_config, loaded_metric) = if metadata_path.exists() {
+        let (loaded_config, loaded_metric, segment_dir_names_opt) = if metadata_path.exists() {
             debug!("Loading HNSW index metadata from {:?}", metadata_path);
             let file = fs::File::open(&metadata_path).map_err(|e| VortexError::IoError { path: metadata_path.clone(), source: e })?;
             
-            // For HnswIndex metadata, we only store config and metric.
-            // Segment list/paths will be discovered or stored here too.
             #[derive(Deserialize)]
             struct IndexFileMetadata {
                 config: HnswConfig,
                 metric: DistanceMetric,
-                // segment_paths: Vec<String>, // Future: to explicitly list segment paths
+                segment_dir_names: Option<Vec<String>>, // Now optional
             }
             let index_file_meta: IndexFileMetadata = serde_json::from_reader(file)
-                .map_err(|e| VortexError::StorageError(format!("Failed to deserialize index metadata from {:?}: {}", metadata_path, e)))?;
-            (index_file_meta.config, index_file_meta.metric)
+                .map_err(|e| VortexError::StorageError(format!("Failed to deserialize HNSWIndex metadata from {:?}: {}", metadata_path, e)))?;
+            (index_file_meta.config, index_file_meta.metric, index_file_meta.segment_dir_names)
         } else {
-            warn!("Index metadata file {:?} not found. Using provided default config/metric.", metadata_path);
-            (default_config, default_metric)
+            warn!("HNSWIndex metadata file {:?} not found. Using provided default config/metric and attempting to load segment_0.", metadata_path);
+            (default_config, default_metric, None)
         };
 
-        // For now, assume only one segment (segment_0) exists.
-        // Later, this will involve discovering/loading multiple segments based on index metadata.
-        let segment0_path = get_segment_path(&index_path, 0);
-        if !segment0_path.exists() {
-            // If the main index metadata existed but segment_0 doesn't, it's an inconsistent state.
-            // However, if index metadata was also missing, we might be trying to open an old format index.
-            // For now, let's assume if segment_0 path is needed, it must exist.
-             return Err(VortexError::StorageError(format!("Segment 0 path does not exist: {:?}", segment0_path)));
+        let mut loaded_segments = Vec::new();
+        if let Some(dir_names) = segment_dir_names_opt {
+            if !dir_names.is_empty() {
+                for dir_name in dir_names {
+                    let segment_path = index_path.join(&dir_name); // Use &dir_name as join takes AsRef<Path>
+                    if segment_path.exists() {
+                        debug!("Loading segment from path: {:?}", segment_path);
+                        let segment = SimpleSegment::load(segment_path).await?;
+                        loaded_segments.push(Arc::new(RwLock::new(segment)));
+                    } else {
+                        warn!("Segment path {:?} listed in HNSWIndex metadata not found, skipping.", segment_path);
+                        // Consider if this should be a hard error depending on desired consistency
+                    }
+                }
+            }
         }
-        let segment0 = SimpleSegment::load(segment0_path).await?;
-        let segments = vec![Arc::new(RwLock::new(segment0))];
+
+        if loaded_segments.is_empty() {
+            warn!("No segments loaded from HNSWIndex metadata or listed segments not found. Attempting to load default segment_0.");
+            let segment0_path = get_segment_path(&index_path, 0);
+            if segment0_path.exists() {
+                debug!("Loading default segment_0 from path: {:?}", segment0_path);
+                let segment0 = SimpleSegment::load(segment0_path).await?;
+                loaded_segments.push(Arc::new(RwLock::new(segment0)));
+            } else {
+                // If creating a new index, HnswIndex::new() handles segment creation.
+                // HnswIndex::open() implies the index (and thus at least one segment) should exist.
+                return Err(VortexError::StorageError(format!("No segments found for HNSWIndex {:?}, and default segment_0 also missing.", index_path)));
+            }
+        }
         
-        info!("Successfully opened HNSW index. Loaded {} segment(s). Using config: {:?}, metric: {:?}", segments.len(), loaded_config, loaded_metric);
+        info!("Successfully opened HNSW index. Loaded {} segment(s). Using config: {:?}, metric: {:?}", loaded_segments.len(), loaded_config, loaded_metric);
 
         Ok(HnswIndex {
             path: index_path,
             config: loaded_config, 
             metric: loaded_metric, 
-            // _rng: create_rng(loaded_config.seed), // Removed
-            segments,
+            segments: loaded_segments,
         })
     }
     
-    fn save_index_metadata(&self) -> VortexResult<()> {
-        let metadata_path = get_metadata_path(&self.path);
-        let temp_metadata_path = metadata_path.with_extension("tmp_idx_meta.json");
-
-        #[derive(Serialize)]
-        struct IndexFileMetadata<'a> {
-            config: &'a HnswConfig,
-            metric: &'a DistanceMetric,
-            // segment_paths: Vec<String>, // Future
-        }
-
-        let metadata_content = IndexFileMetadata {
-            config: &self.config,
-            metric: &self.metric,
-            // segment_paths: self.segments.iter().map(|s| s.read().await.path().to_string_lossy().into_owned()).collect(), // Example for future
-        };
-        
-        let file = fs::File::create(&temp_metadata_path).map_err(|e| VortexError::IoError { path: temp_metadata_path.clone(), source: e })?;
-        serde_json::to_writer_pretty(file, &metadata_content)
-            .map_err(|e| VortexError::StorageError(format!("Failed to serialize index metadata: {}", e)))?;
-        
-        fs::rename(&temp_metadata_path, &metadata_path).map_err(|e| VortexError::IoError { path: temp_metadata_path.clone(), source: e })?;
-        debug!("Successfully saved HNSW index-level metadata to {:?}", metadata_path);
-        Ok(())
-    }
+    // fn save_index_metadata(&self) -> VortexResult<()> { // This method is replaced by save_index_metadata_async
+    // ... old content ...
+    // }
 
     // insert_vector is now part of the Index trait (async)
     // The old HnswIndex::insert_vector (sync) logic needs to be adapted into SimpleSegment::insert_vector (async)
@@ -270,8 +324,8 @@ impl Index for HnswIndex {
             // This case should ideally not happen if new() always creates a segment.
             return Err(VortexError::Internal("No segments available in HnswIndex".to_string()));
         }
-        // For now, add to the first segment. Later, logic to choose/create segment.
-        let mut segment = self.segments[0].write().await;
+        // The following lines for `segment` are unused due to the logic below.
+        // let mut segment = self.segments[0].write().await; 
         
         // Check if vector_id already exists in this segment.
         // This check might need to be global across all segments in the future.
@@ -303,7 +357,16 @@ impl Index for HnswIndex {
         // For now, let SimpleSegment handle its internal map.
         // The `bool` return from `add_vector` indicates if it was a new insert (true) or an update (false).
         // SimpleSegment::insert_vector now returns Result<bool, VortexError>.
-        segment.insert_vector(id, vector).await // Directly return the result from the segment
+        
+        // Decide which segment to add to. For now, always add to the *last* segment.
+        // This is a simple strategy for testing. Real strategies would be more complex.
+        if let Some(last_segment_arc) = self.segments.last() {
+            let mut segment_guard = last_segment_arc.write().await;
+            return segment_guard.insert_vector(id, vector).await;
+        } else {
+            // This should not happen if HnswIndex::new always creates a segment.
+            return Err(VortexError::Internal("No segments available to add vector".to_string()));
+        }
     }
 
     async fn search(&self, query: Embedding, k: usize) -> VortexResult<Vec<(VectorId, f32)>> {
@@ -329,23 +392,60 @@ impl Index for HnswIndex {
         // For now, we call the current Segment::search which doesn't take ef_search.
         
         if self.segments.is_empty() {
+            debug!("Search called on HnswIndex with no segments.");
             return Ok(Vec::new());
         }
-        // Delegate to the first segment.
-        let segment = self.segments[0].read().await;
-        // Pass ef_search_override to the segment's search method.
-        let results = segment.search(&query, k, ef_search_override).await?;
+
+        let mut search_futures = Vec::new();
+        for segment_arc in &self.segments {
+            let segment_clone = Arc::clone(segment_arc);
+            let query_clone = query.clone(); // Clone query for each async task
+            search_futures.push(async move {
+                let segment_guard = segment_clone.read().await;
+                segment_guard.search(&query_clone, k + 10, ef_search_override).await // Fetch slightly more from each segment for better global top-k
+            });
+        }
+
+        let segment_results_list: Vec<Vec<SegmentSearchResult>> = try_join_all(search_futures)
+            .await?
+            .into_iter()
+            .collect();
+
+        let mut all_results: Vec<SegmentSearchResult> = segment_results_list.into_iter().flatten().collect();
+
+        // Sort all collected results by distance.
+        // For Cosine, higher is better, so sort descending.
+        // For L2, lower is better, so sort ascending.
+        match self.metric {
+            DistanceMetric::Cosine => {
+                all_results.sort_by(|a, b| b.distance.partial_cmp(&a.distance).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            DistanceMetric::L2 => {
+                all_results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+        // TODO: Add a proper deduplication strategy here if points can exist in multiple segments
+        // or if a single point can be returned multiple times from one segment's k+10 search.
+        // For now, simple truncation assumes the sort order is sufficient for top-k.
+
+        // Deduplicate by ID, keeping the one with the smallest distance (already sorted)
+        // This is important if segments could somehow have overlapping IDs, though current add logic doesn't cause this.
+        // For now, a simple sort and truncate is fine. If deduplication is needed later:
+        // all_results.dedup_by_key(|sr| sr.id.clone()); // This would need PartialEq on SearchResult by id
+
+        // Take top k
+        all_results.truncate(k);
         
-        // Convert SearchResult to (VectorId, f32)
-        Ok(results.into_iter().map(|sr| (sr.id, sr.distance)).collect())
+        // Convert SegmentSearchResult to (VectorId, f32)
+        Ok(all_results.into_iter().map(|sr| (sr.id, sr.distance)).collect())
     }
 
     async fn save(&mut self, _writer: &mut (dyn Write + Send)) -> VortexResult<()> {
         info!("Saving HNSW index (segment-based)...");
-        self.save_index_metadata()?; // Save overall index metadata
+        self.save_index_metadata_async().await?; // Save overall index metadata, now async
 
         for segment_arc in &self.segments {
-            let mut segment = segment_arc.write().await;
+            let mut segment = segment_arc.write().await; // Ensure segment is mutable if save requires &mut self
             segment.save().await?; // Each segment saves itself
         }
         
@@ -355,26 +455,94 @@ impl Index for HnswIndex {
 
     async fn delete_vector(&mut self, id: &VectorId) -> VortexResult<bool> {
         if self.segments.is_empty() {
+            debug!("Delete_vector called on HnswIndex with no segments.");
             return Ok(false);
         }
-        // For now, try to delete from the first segment.
-        // Later, need to identify which segment holds the ID.
-        let mut segment = self.segments[0].write().await;
-        segment.delete_vector(id).await.map(|_| true) // Assuming Ok means success
-          .or_else(|e| match e {
-              VortexError::NotFound(_) => Ok(false), // Not found in this segment
-              _ => Err(e),
-          })
+
+        let mut deleted_globally = false;
+        // Attempt to delete from all segments. If an ID is globally unique, only one will succeed.
+        // If IDs are not globally unique (not current design for add), this would delete from all.
+        for segment_arc in &self.segments {
+            let mut segment_guard = segment_arc.write().await;
+            match segment_guard.delete_vector(id).await {
+                Ok(()) => { // Successfully deleted in this segment
+                    deleted_globally = true;
+                    // If IDs are guaranteed unique across segments, we could break here.
+                    // For now, let's assume we try all segments.
+                }
+                Err(VortexError::NotFound(_)) => { /* Not found in this segment, continue */ }
+                Err(e) => return Err(e), // Propagate other errors
+            }
+        }
+        Ok(deleted_globally)
     }
 
     async fn get_vector(&self, id: &VectorId) -> VortexResult<Option<Embedding>> {
         if self.segments.is_empty() {
+            debug!("Get_vector called on HnswIndex with no segments.");
             return Ok(None);
         }
-        // For now, try to get from the first segment.
-        // Later, need to identify which segment holds the ID or search all.
-        let segment = self.segments[0].read().await;
-        segment.get_vector(id).await
+
+        let mut find_futures = Vec::new();
+        for segment_arc in &self.segments {
+            let segment_clone = Arc::clone(segment_arc);
+            let id_clone = id.clone();
+            find_futures.push(async move {
+                let segment_guard = segment_clone.read().await;
+                segment_guard.get_vector(&id_clone).await // This future resolves to VortexResult<Option<Embedding>>
+            });
+        }
+
+        // try_join_all on Vec<Future<Output = VortexResult<T>>> returns VortexResult<Vec<T>>
+        let results_from_segments: Vec<Option<Embedding>> = try_join_all(find_futures).await?;
+        
+        for maybe_embedding in &results_from_segments { // Iterate by reference
+            if let Some(embedding) = maybe_embedding {
+                return Ok(Some(embedding.clone())); // Clone the embedding
+            }
+            // If None, it means it was Ok(None) from the segment's get_vector, so continue checking others.
+            // Errors from individual segment futures would have been propagated by try_join_all's `?` above.
+        }
+        // If loop completes, it means all segments returned Ok(None) or were successfully processed by try_join_all.
+        // However, the current structure of try_join_all means if one segment's get_vector returns Err(VortexError::NotFound),
+        // that error might not propagate correctly if we want to continue searching other segments.
+        // Let's refine: each future should resolve to VortexResult<Option<Embedding>>.
+        // try_join_all will give VortexResult<Vec<Option<Embedding>>>.
+        // If any segment future errors with something other than NotFound, try_join_all propagates it.
+        // If all are Ok(None) or Ok(Some(_)), we iterate.
+
+        // The above logic for try_join_all is correct. The issue was the type annotation.
+        // The iteration logic also needs to handle the case where a segment's get_vector itself returns an error
+        // that isn't propagated by try_join_all (e.g. if we mapped errors inside the futures).
+        // But since segment.get_vector directly returns VortexResult, try_join_all handles propagation of the first non-Ok error.
+        // So, if we reach here, all futures resolved to Ok(Option<Embedding>).
+        // The iteration `for maybe_embedding in results_from_segments` is correct.
+
+        // Let's re-check the logic for `get_vector` with `try_join_all`.
+        // Each future `segment_guard.get_vector(&id_clone).await` has type `VortexResult<Option<Embedding>>`.
+        // `try_join_all` collects these. If any future errors (e.g. `VortexError::StorageError`), `try_join_all` itself will error out.
+        // If all futures succeed (i.e., return `Ok(Option<Embedding>)`), then `try_join_all(...).await?` will yield `Vec<Option<Embedding>>`.
+        // Then we iterate through this `Vec<Option<Embedding>>`.
+        // This seems correct. The original error was just the type annotation.
+
+        // The previous iteration logic was:
+        // for result in results { // where results was Vec<VortexResult<Option<Embedding>>>
+        //     match result {
+        //         Ok(Some(embedding)) => return Ok(Some(embedding)),
+        //         Ok(None) => { /* Not in this segment */ }
+        //         Err(VortexError::NotFound(_)) => { /* Not in this segment */ } // This case won't happen if try_join_all propagates NotFound
+        //         Err(e) => return Err(e), 
+        //     }
+        // }
+        // With `let results_from_segments: Vec<Option<Embedding>> = try_join_all(find_futures).await?;`
+        // we only iterate if all futures returned Ok.
+        // This second loop is actually redundant due to the check above.
+        // If the first loop completes without returning, it means no Some(embedding) was found.
+        // So we can directly return Ok(None) after the first loop.
+        // The previous commented out code block was actually trying to re-iterate the moved value.
+        // The fix is to ensure the first loop correctly identifies if an embedding was found.
+        // If the loop `for maybe_embedding in &results_from_segments` finishes, it means no embedding was found.
+        Ok(None) // Not found in any segment
     }
 
     fn len(&self) -> usize {
@@ -398,8 +566,18 @@ impl Index for HnswIndex {
             // For now, let's make a potentially expensive sum if multiple segments.
             // Or, HnswIndex tracks total length.
             // Let's assume HnswIndex will track total length.
-            // For now, just use segment 0.
-            futures::executor::block_on(async { self.segments[0].read().await.vector_count() })
+            // Sum lengths of all segments.
+            // This uses block_on because the Index::len() trait method is synchronous.
+            // A better long-term solution might involve HnswIndex tracking total length
+            // or making len() async in the trait if possible.
+            futures::executor::block_on(async {
+                let mut total_len = 0;
+                for segment_arc in &self.segments {
+                    let segment_guard = segment_arc.read().await;
+                    total_len += segment_guard.vector_count();
+                }
+                total_len
+            })
         }
     }
 
@@ -426,14 +604,37 @@ impl Index for HnswIndex {
             return Ok(Vec::new());
         }
         
-        // For now, list from the first segment.
-        // TODO: Implement aggregation from multiple segments if/when HnswIndex supports multiple active segments for listing.
-        // This might involve collecting from each segment and then applying a global limit,
-        // or distributing the limit among segments.
+        // For now, list from all segments and apply limit globally.
+        // TODO: This could be memory intensive for large number of segments / vectors.
+        // Consider more sophisticated pagination or streaming in the future.
         
-        let segment = self.segments[0].read().await;
-        debug!(segment_path=?segment.path(), ?limit, "HnswIndex::list_vectors delegating to segment 0.");
-        segment.list_vectors(limit).await
+        let mut list_futures = Vec::new();
+        for segment_arc in &self.segments {
+            let segment_clone = Arc::clone(segment_arc);
+            // For list_vectors, we don't need to pass a limit to each segment if we are applying it globally.
+            // However, if segments are very large, fetching all might be too much.
+            // For now, let's fetch all from each segment and then limit.
+            // A more optimized approach might fetch `limit` from each, then merge and re-limit,
+            // but that assumes some ordering or relevance which list_vectors doesn't guarantee.
+            list_futures.push(async move {
+                let segment_guard = segment_clone.read().await;
+                segment_guard.list_vectors(None).await // Fetch all from this segment
+            });
+        }
+
+        let segment_vector_lists: Vec<Vec<(VectorId, Embedding)>> = try_join_all(list_futures)
+            .await?
+            .into_iter()
+            .collect();
+
+        let mut all_vectors: Vec<(VectorId, Embedding)> = segment_vector_lists.into_iter().flatten().collect();
+
+        if let Some(l) = limit {
+            all_vectors.truncate(l);
+        }
+        
+        debug!(num_vectors_listed=all_vectors.len(), ?limit, "HnswIndex::list_vectors completed.");
+        Ok(all_vectors)
     }
 
     fn estimate_ram_footprint(&self) -> u64 {
@@ -469,13 +670,24 @@ mod tests {
     // use crate::error::VortexError; // Keep if specific errors are checked
     use crate::vector::Embedding;
     use tempfile::tempdir;
+    use tokio::fs as async_fs; // For async file operations in tests if needed
     // use std::io::{Cursor, BufWriter}; // Not needed for these initial tests
     // use std::fs::File; // Not needed for these initial tests
     // use crate::hnsw::ArcNode; // ArcNode is removed
 
     fn create_test_config() -> HnswConfig {
         // Ensure vector_dim is set, as HnswIndex::new relies on config.vector_dim
-        HnswConfig { vector_dim: 2, m: 5, m_max0: 10, ef_construction: 20, ef_search: 10, ml: 0.5, seed: Some(123) }
+        HnswConfig { 
+            vector_dim: 2, 
+            m: 5, 
+            m_max0: 10, 
+            ef_construction: 20, 
+            ef_search: 10, 
+            ml: 0.5, 
+            seed: Some(123),
+            vector_storage_capacity: None, // Added missing field
+            graph_links_capacity: None,    // Added missing field
+        }
     }
 
     #[tokio::test]
@@ -604,7 +816,17 @@ mod tests {
 
         } // index_to_save is dropped
 
-        let default_test_config = HnswConfig { vector_dim: 3, m: 1, m_max0: 1, ef_construction: 1, ef_search: 1, ml: 0.1, seed: Some(999) };
+        let default_test_config = HnswConfig { 
+            vector_dim: 3, 
+            m: 1, 
+            m_max0: 1, 
+            ef_construction: 1, 
+            ef_search: 1, 
+            ml: 0.1, 
+            seed: Some(999),
+            vector_storage_capacity: None, // Added missing field
+            graph_links_capacity: None,    // Added missing field
+        };
         let default_test_metric = DistanceMetric::L2;
         
         let opened_index = HnswIndex::open(base_path, index_name, default_test_config, default_test_metric).await.unwrap();
@@ -690,7 +912,7 @@ mod tests {
         assert!(opened_index_result.is_err(), "Opening an index with corrupted index metadata should fail.");
         match opened_index_result.err().unwrap() {
             VortexError::StorageError(msg) => {
-                assert!(msg.contains("Failed to deserialize index metadata"));
+                assert!(msg.contains("Failed to deserialize HNSWIndex metadata"));
             }
             _ => panic!("Expected StorageError for corrupted index metadata."),
         }
@@ -737,5 +959,165 @@ mod tests {
         let listed_after_delete = index.list_vectors(None).await.unwrap();
         assert_eq!(listed_after_delete.len(), 2, "Should list 2 vectors after one deletion from HnswIndex");
         assert!(!listed_after_delete.iter().any(|(id, _)| id == &vec2.0));
+    }
+
+    #[tokio::test]
+    async fn test_multi_segment_add_and_search() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path();
+        let mut config = create_test_config();
+        config.vector_dim = 2;
+        let index_name = "test_multi_seg_add_search";
+        let mut index = HnswIndex::new(base_path, index_name, config, DistanceMetric::L2).await.unwrap();
+
+        // Add to segment 0
+        let vec1_s0 = ("vec1_s0".to_string(), Embedding::from(vec![1.0, 1.0]));
+        let vec2_s0 = ("vec2_s0".to_string(), Embedding::from(vec![2.0, 2.0]));
+        index.add_vector(vec1_s0.0.clone(), vec1_s0.1.clone()).await.unwrap();
+        index.add_vector(vec2_s0.0.clone(), vec2_s0.1.clone()).await.unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.segment_count(), 1);
+
+        // Add a new segment (segment 1)
+        let new_segment_idx = index.add_new_segment_for_testing().await.unwrap();
+        assert_eq!(new_segment_idx, 1);
+        assert_eq!(index.segment_count(), 2);
+        
+        // Add to segment 1 (HnswIndex::add_vector now adds to the last segment)
+        let vec1_s1 = ("vec1_s1".to_string(), Embedding::from(vec![10.0, 10.0]));
+        let vec2_s1 = ("vec2_s1".to_string(), Embedding::from(vec![11.0, 11.0]));
+        index.add_vector(vec1_s1.0.clone(), vec1_s1.1.clone()).await.unwrap();
+        index.add_vector(vec2_s1.0.clone(), vec2_s1.1.clone()).await.unwrap();
+        
+        assert_eq!(index.len(), 4, "Total length should be 4 after adding to both segments.");
+
+        // Verify vectors are in their respective segments (by checking segment lengths)
+        let seg0_guard = index.segments[0].read().await;
+        assert_eq!(seg0_guard.vector_count(), 2, "Segment 0 should have 2 vectors.");
+        drop(seg0_guard);
+        let seg1_guard = index.segments[1].read().await;
+        assert_eq!(seg1_guard.vector_count(), 2, "Segment 1 should have 2 vectors.");
+        drop(seg1_guard);
+
+
+        // Search for a vector close to one in segment 0
+        let query_s0 = Embedding::from(vec![1.5, 1.5]);
+        let results_s0 = index.search(query_s0, 2).await.unwrap();
+        assert_eq!(results_s0.len(), 2);
+        assert!(results_s0.iter().any(|(id, _)| id == &vec1_s0.0 || id == &vec2_s0.0));
+        // Ensure results are from segment 0 primarily
+        assert!(results_s0[0].0 == vec1_s0.0 || results_s0[0].0 == vec2_s0.0);
+
+
+        // Search for a vector close to one in segment 1
+        let query_s1 = Embedding::from(vec![10.5, 10.5]);
+        let results_s1 = index.search(query_s1, 2).await.unwrap();
+        assert_eq!(results_s1.len(), 2);
+        assert!(results_s1.iter().any(|(id, _)| id == &vec1_s1.0 || id == &vec2_s1.0));
+         // Ensure results are from segment 1 primarily
+        assert!(results_s1[0].0 == vec1_s1.0 || results_s1[0].0 == vec2_s1.0);
+
+
+        // Global search that should pull from both
+        let query_global_closer_s0 = Embedding::from(vec![0.0, 0.0]); // Closest to vec1_s0
+        let results_global = index.search(query_global_closer_s0, 4).await.unwrap();
+        assert_eq!(results_global.len(), 4);
+        assert_eq!(results_global[0].0, vec1_s0.0); // vec1_s0 should be first
+
+        // Get vector from segment 0
+        assert!(index.get_vector(&vec1_s0.0).await.unwrap().is_some());
+        // Get vector from segment 1
+        assert!(index.get_vector(&vec1_s1.0).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_multi_segment_save_and_open() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path();
+        let mut config = create_test_config();
+        config.vector_dim = 2;
+        let index_name = "test_multi_seg_save_open";
+        
+        let vec1_s0_id = "vec1_s0_save";
+        let vec1_s1_id = "vec1_s1_save";
+
+        {
+            let mut index_to_save = HnswIndex::new(base_path, index_name, config, DistanceMetric::L2).await.unwrap();
+            index_to_save.add_vector(vec1_s0_id.to_string(), Embedding::from(vec![1.0, 1.0])).await.unwrap();
+            
+            index_to_save.add_new_segment_for_testing().await.unwrap(); // Add segment 1
+            index_to_save.add_vector(vec1_s1_id.to_string(), Embedding::from(vec![10.0, 10.0])).await.unwrap(); // Goes to segment 1
+
+            assert_eq!(index_to_save.segment_count(), 2);
+            assert_eq!(index_to_save.len(), 2);
+
+            let mut dummy_writer = Vec::new();
+            index_to_save.save(&mut dummy_writer).await.unwrap();
+
+            // Check HNSWIndex metadata file for segment_dir_names
+            let index_meta_path = get_metadata_path(&base_path.join(index_name));
+            let meta_content = async_fs::read_to_string(index_meta_path).await.unwrap();
+            assert!(meta_content.contains("segment_0"));
+            assert!(meta_content.contains("segment_1"));
+        }
+
+        let opened_index = HnswIndex::open(base_path, index_name, config, DistanceMetric::L2).await.unwrap();
+        assert_eq!(opened_index.segment_count(), 2, "Opened index should have 2 segments.");
+        assert_eq!(opened_index.len(), 2, "Opened index should have 2 vectors in total.");
+
+        assert!(opened_index.get_vector(&vec1_s0_id.to_string()).await.unwrap().is_some(), "Vector from segment 0 should exist.");
+        assert!(opened_index.get_vector(&vec1_s1_id.to_string()).await.unwrap().is_some(), "Vector from segment 1 should exist.");
+        
+        // Verify segment paths were loaded correctly
+        let seg0_path_expected = get_segment_path(&base_path.join(index_name), 0);
+        let seg1_path_expected = get_segment_path(&base_path.join(index_name), 1);
+        
+        let seg0_guard_opened = opened_index.segments[0].read().await;
+        assert_eq!(seg0_guard_opened.path(), seg0_path_expected);
+        assert_eq!(seg0_guard_opened.vector_count(), 1);
+        drop(seg0_guard_opened);
+
+        let seg1_guard_opened = opened_index.segments[1].read().await;
+        assert_eq!(seg1_guard_opened.path(), seg1_path_expected);
+        assert_eq!(seg1_guard_opened.vector_count(), 1);
+        drop(seg1_guard_opened);
+    }
+
+    #[tokio::test]
+    async fn test_multi_segment_delete() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path();
+        let mut config = create_test_config();
+        config.vector_dim = 2;
+        let index_name = "test_multi_seg_delete";
+        let mut index = HnswIndex::new(base_path, index_name, config, DistanceMetric::L2).await.unwrap();
+
+        let vec1_s0_id = "del_vec1_s0";
+        index.add_vector(vec1_s0_id.to_string(), Embedding::from(vec![1.0, 1.0])).await.unwrap();
+        
+        index.add_new_segment_for_testing().await.unwrap(); // Add segment 1
+        let vec1_s1_id = "del_vec1_s1";
+        index.add_vector(vec1_s1_id.to_string(), Embedding::from(vec![10.0, 10.0])).await.unwrap(); // Goes to segment 1
+        
+        assert_eq!(index.len(), 2);
+
+        // Delete from segment 0 (HnswIndex::delete_vector tries all segments)
+        // To target segment 0 specifically for deletion, we'd need a different add_vector strategy or direct segment access.
+        // Current HnswIndex::delete_vector iterates all segments.
+        let deleted_s0 = index.delete_vector(&vec1_s0_id.to_string()).await.unwrap();
+        assert!(deleted_s0, "Should confirm deletion of vec1_s0_id");
+        assert_eq!(index.len(), 1, "Length should be 1 after deleting from segment 0.");
+        assert!(index.get_vector(&vec1_s0_id.to_string()).await.unwrap().is_none(), "vec1_s0_id should be gone.");
+        assert!(index.get_vector(&vec1_s1_id.to_string()).await.unwrap().is_some(), "vec1_s1_id should still exist.");
+
+        // Delete from segment 1
+        let deleted_s1 = index.delete_vector(&vec1_s1_id.to_string()).await.unwrap();
+        assert!(deleted_s1, "Should confirm deletion of vec1_s1_id");
+        assert_eq!(index.len(), 0, "Length should be 0 after deleting from segment 1.");
+        assert!(index.get_vector(&vec1_s1_id.to_string()).await.unwrap().is_none(), "vec1_s1_id should be gone.");
+
+        // Try deleting a non-existent ID
+        let deleted_non_existent = index.delete_vector(&"non_existent_id".to_string()).await.unwrap();
+        assert!(!deleted_non_existent, "Deleting non-existent ID should return false.");
     }
 }

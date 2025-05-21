@@ -47,6 +47,8 @@ async fn test_wal_recovery_simple_operations() {
             ml: 0.33,
             seed: None,
             vector_dim: 3, // This is crucial
+            vector_storage_capacity: None,
+            graph_links_capacity: None,
         };
         let create_index_req = CreateIndexRequest {
             name: index_name.clone(),

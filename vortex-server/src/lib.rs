@@ -5,6 +5,7 @@ pub mod error;
 pub mod handlers;
 pub mod models;
 pub mod persistence;
+pub mod snapshot_manager; // Added snapshot_manager module
 pub mod state;
 pub mod wal;
 pub mod payload_index;

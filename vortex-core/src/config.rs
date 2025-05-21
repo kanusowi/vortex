@@ -18,6 +18,10 @@ pub struct HnswConfig {
     pub seed: Option<u64>,
     /// Dimensionality of the vectors.
     pub vector_dim: u32,
+    /// Optional initial capacity for vector storage (number of vectors).
+    pub vector_storage_capacity: Option<usize>,
+    /// Optional initial capacity for graph links storage (number of nodes/vectors).
+    pub graph_links_capacity: Option<usize>,
     // Add payload storage flag later if needed
     // pub store_payloads: bool,
 }
@@ -33,6 +37,8 @@ impl HnswConfig {
             ef_search,
             ml,
             seed: None, // Default to random seed
+            vector_storage_capacity: None,
+            graph_links_capacity: None,
         }
     }
 
@@ -71,6 +77,8 @@ impl Default for HnswConfig {
             ef_search: 50,
             ml: 1.0 / (16.0f64.ln()), // Standard heuristic based on M
             seed: None,
+            vector_storage_capacity: None,
+            graph_links_capacity: None,
         }
     }
 }

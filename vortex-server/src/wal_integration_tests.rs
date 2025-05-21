@@ -47,6 +47,8 @@ async fn test_wal_recovery_simple_operations() {
                 ml: 0.33,
                 seed: Some(0),   // Corrected seed to Option<u64>
                 vector_dim: 3, // Added missing field
+                vector_storage_capacity: None,
+                graph_links_capacity: None,
             }
         };
 
@@ -170,7 +172,7 @@ async fn test_wal_recovery_with_checkpointing() {
             name: index_name.clone(),
             dimensions: 3,
             metric: vortex_core::DistanceMetric::L2,
-            config: vortex_core::HnswConfig { m: 8, m_max0: 16, ef_construction: 50, ef_search: 20, ml: 0.5, seed: Some(42), vector_dim: 3 }, // Added missing field
+            config: vortex_core::HnswConfig { m: 8, m_max0: 16, ef_construction: 50, ef_search: 20, ml: 0.5, seed: Some(42), vector_dim: 3, vector_storage_capacity: None, graph_links_capacity: None }, // Added missing field
         };
         crate::handlers::create_index(axum::extract::State(app_state.clone()), Json(create_req))
             .await

@@ -6,6 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../vortex-proto/src/proto/vortex/api/v1/common.proto",
         "../vortex-proto/src/proto/vortex/api/v1/collections_service.proto",
         "../vortex-proto/src/proto/vortex/api/v1/points_service.proto",
+        "../vortex-proto/src/proto/vortex/api/v1/snapshots_service.proto",
     ];
 
     // Define the include path for resolving imports.
@@ -18,9 +19,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Our own protos are in `vortex-proto/src/proto`.
     // The import `src/proto/vortex/api/v1/common.proto` needs `vortex-proto` as an include path.
     // The import `google/protobuf/struct.proto` needs `vortex-proto/buf/build/googleapis/googleapis` as an include path.
+    // For imports like `import "vortex/api/v1/common.proto";` within proto files,
+    // the include path should point to the directory containing the top-level package directory (e.g., `vortex`).
+    // So, `../vortex-proto/src/proto` should be an include path.
 
     let include_paths = &[
-        "../vortex-proto/", // For resolving "src/proto/vortex/api/v1/common.proto"
+        "../vortex-proto/src/proto", // For resolving "vortex/api/v1/common.proto" from other protos
         "../vortex-proto/buf/build/googleapis/googleapis/", // For "google/protobuf/struct.proto"
     ];
 
@@ -31,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".google.protobuf.Value", "::prost_types::Value")
         .extern_path(".google.protobuf.Struct", "::prost_types::Struct")
         .extern_path(".google.protobuf.ListValue", "::prost_types::ListValue")
+        .extern_path(".google.protobuf.Timestamp", "::prost_types::Timestamp")
         .compile(proto_files, include_paths)?;
 
     Ok(())

@@ -77,6 +77,21 @@ impl PayloadIndexRocksDB {
         })
     }
 
+    /// Flushes the RocksDB WAL.
+    pub fn flush_db_wal(&self) -> Result<(), ServerError> {
+        self.db.flush_wal(true).map_err(|e| {
+            ServerError::RocksDBError(format!("Failed to flush RocksDB WAL: {}", e))
+        })
+    }
+
+    /// Creates a RocksDB checkpoint at the specified path.
+    pub fn create_checkpoint(&self, checkpoint_path: &Path) -> Result<(), ServerError> {
+        let checkpoint = rocksdb::checkpoint::Checkpoint::new(&self.db)
+            .map_err(|e| ServerError::RocksDBError(format!("Failed to create RocksDB checkpoint object: {}", e)))?;
+        checkpoint.create_checkpoint(checkpoint_path)
+            .map_err(|e| ServerError::RocksDBError(format!("Failed to create RocksDB checkpoint at {:?}: {}", checkpoint_path, e)))
+    }
+
     // TODO: Add methods for filtering based on payload content.
     // Example:
     // pub fn filter_by_key_value(&self, key: &str, value: &Value) -> Result<Vec<VectorId>, ServerError> {
