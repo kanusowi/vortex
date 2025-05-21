@@ -86,3 +86,9 @@ enum StatusCode {
   INVALID_ARGUMENT = 4;
   // Add more specific error codes as needed.
 }
+
+// General status for an operation, often used in responses.
+message OperationStatus {
+  StatusCode status_code = 1;         // The status code of the operation.
+  optional string error_message = 2;  // An optional error message if the status is not OK.
+}

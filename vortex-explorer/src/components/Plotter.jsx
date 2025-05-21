@@ -1,87 +1,161 @@
 import React, { useMemo } from 'react';
 import Plot from 'react-plotly.js'; 
-import { useSelector } from 'react-redux';
+import { useSelector, useDispatch } from 'react-redux'; // Added useDispatch
 import { 
     selectReducedCoordinates, 
     selectVectorDataStatus, 
     selectRawVectors,
-    selectSearchResults // Import search results selector
+    selectSearchResults,
+    selectSelectedPlotPointId, 
+    setSelectedPlotPointId,
+    selectColorByMetadataField // Added selector for color by field
 } from '../features/vectors/vectorsSlice';
 
 // Define colors for highlighting
-const DEFAULT_COLOR = 'rgba(31, 119, 180, 0.7)'; // Default Plotly blue with opacity
-const HIGHLIGHT_COLOR = 'rgba(255, 127, 14, 1.0)'; // Default Plotly orange, opaque
+const DEFAULT_COLOR = 'rgba(31, 119, 180, 0.7)'; 
+const HIGHLIGHT_COLOR = 'rgba(255, 127, 14, 1.0)'; 
+const SELECTED_COLOR = 'rgba(214, 39, 40, 1.0)'; 
 const DEFAULT_SIZE = 6;
 const HIGHLIGHT_SIZE = 9;
+const SELECTED_SIZE = 12;
+const SELECTED_BORDER_WIDTH = 2;
+const SELECTED_BORDER_COLOR = 'rgba(0, 0, 0, 1.0)';
+const MISSING_VALUE_COLOR = 'rgba(200, 200, 200, 0.5)';
+const CATEGORICAL_PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'];
+
 
 function Plotter({ indexName }) {
+    const dispatch = useDispatch(); 
     const reducedCoords = useSelector(selectReducedCoordinates(indexName)); 
-    const vectorFetchStatus = useSelector(selectVectorDataStatus(indexName));
     const rawVectorsData = useSelector(selectRawVectors(indexName)); 
-    const searchResults = useSelector(selectSearchResults(indexName)); // Get search results {id: string, score: number}[]
+    const searchResults = useSelector(selectSearchResults(indexName));
+    const selectedPlotPointId = useSelector(selectSelectedPlotPointId(indexName));
+    const colorByField = useSelector(selectColorByMetadataField(indexName));
 
     // Memoize plot data generation
     const plotData = useMemo(() => {
-        if (!reducedCoords || reducedCoords.length === 0) {
+        if (!reducedCoords || reducedCoords.length === 0 || !rawVectorsData || rawVectorsData.length === 0) {
             return null;
         }
 
-        // Extract IDs from raw data, ensuring the order matches reducedCoords
-        // This assumes reducedCoords maintains the original order of vectors passed to UMAP
-        const vectorIds = rawVectorsData?.map(item => item.id) || []; 
-        
-        // Check if lengths match - they should if reduction was based on rawVectorsData
+        const vectorIds = rawVectorsData.map(item => item.id);
         if (vectorIds.length !== reducedCoords.length) {
-             console.warn("Mismatch between vector IDs and reduced coordinates count.");
-             // Fallback: generate generic hover text or disable it
-             // Consider returning null or an empty trace if mismatch is critical
+             console.warn("Mismatch between rawVectorsData IDs and reduced coordinates count.");
         }
 
-        // Create a Set of highlighted IDs for quick lookup
-        const highlightedIds = new Set(searchResults?.map(item => item.id) || []);
+        const searchHighlightedIds = new Set(searchResults?.map(item => item.id) || []);
+        
+        let pointColors = [];
+        let markerSizeArray = [];
+        let markerBorderWidthArray = [];
+        let markerBorderColorArray = [];
+        let traceMarkerConfig = {};
+        let showLegendForColorBy = false;
 
-        // Generate marker properties based on search results
-        const markerColors = vectorIds.map(id => highlightedIds.has(id) ? HIGHLIGHT_COLOR : DEFAULT_COLOR);
-        const markerSizes = vectorIds.map(id => highlightedIds.has(id) ? HIGHLIGHT_SIZE : DEFAULT_SIZE);
-        // Adjust opacity slightly for non-highlighted points if desired
-        // const markerOpacities = vectorIds.map(id => highlightedIds.has(id) ? 1.0 : 0.7);
+        if (colorByField) {
+            const values = rawVectorsData.map(p => p.metadata?.[colorByField]);
+            const uniqueValues = [...new Set(values.filter(v => v !== undefined && v !== null))];
+            
+            // Simple heuristic: if more than 10 unique values or if any value is not a number, treat as categorical.
+            // This can be improved.
+            const isNumeric = uniqueValues.length > 0 && uniqueValues.every(v => typeof v === 'number') && uniqueValues.length > 10;
+
+            if (isNumeric) {
+                const numericValues = values.map(v => typeof v === 'number' ? v : undefined); // Keep undefined for non-numbers
+                const min = Math.min(...numericValues.filter(v => v !== undefined));
+                const max = Math.max(...numericValues.filter(v => v !== undefined));
+                
+                pointColors = numericValues.map(v => v === undefined ? MISSING_VALUE_COLOR : v); // Pass raw numbers to plotly for colorscale
+                traceMarkerConfig = {
+                    color: pointColors,
+                    colorscale: 'Viridis', // Example colorscale
+                    showscale: true, // Show color bar legend
+                    colorbar: { title: colorByField, titleside: 'right' },
+                };
+                showLegendForColorBy = true;
+            } else { // Categorical
+                const valueToColorMap = new Map();
+                uniqueValues.forEach((val, i) => {
+                    valueToColorMap.set(val, CATEGORICAL_PALETTE[i % CATEGORICAL_PALETTE.length]);
+                });
+                pointColors = values.map(v => valueToColorMap.get(v) || MISSING_VALUE_COLOR);
+                traceMarkerConfig = { color: pointColors };
+                // For categorical, Plotly might generate a legend if we create separate traces,
+                // or we might need a custom legend component. For now, hover text will be key.
+                // showLegendForColorBy = uniqueValues.length <= CATEGORICAL_PALETTE.length; // Basic legend for few categories
+            }
+        }
+
+        rawVectorsData.forEach((point, i) => {
+            const id = point.id;
+            if (id === selectedPlotPointId) {
+                markerSizeArray.push(SELECTED_SIZE);
+                markerBorderWidthArray.push(SELECTED_BORDER_WIDTH);
+                markerBorderColorArray.push(SELECTED_BORDER_COLOR);
+                if (!colorByField) pointColors.push(SELECTED_COLOR);
+                else if (pointColors[i] === undefined) pointColors[i] = SELECTED_COLOR; // Ensure selected color if no metadata color
+            } else if (searchHighlightedIds.has(id)) {
+                markerSizeArray.push(HIGHLIGHT_SIZE);
+                markerBorderWidthArray.push(1);
+                markerBorderColorArray.push('rgba(0, 0, 0, 0.7)');
+                if (!colorByField) pointColors.push(HIGHLIGHT_COLOR);
+                else if (pointColors[i] === undefined) pointColors[i] = HIGHLIGHT_COLOR;
+            } else {
+                markerSizeArray.push(DEFAULT_SIZE);
+                markerBorderWidthArray.push(0);
+                markerBorderColorArray.push('rgba(0,0,0,0)');
+                if (!colorByField) pointColors.push(DEFAULT_COLOR);
+                else if (pointColors[i] === undefined) pointColors[i] = DEFAULT_COLOR;
+            }
+        });
+        
+        if (!colorByField && pointColors.length === 0 && rawVectorsData.length > 0) { // Default coloring if no colorByField and not handled above
+             pointColors = rawVectorsData.map(() => DEFAULT_COLOR);
+        }
+
 
         const trace = {
             x: reducedCoords.map(p => p[0]),
             y: reducedCoords.map(p => p[1]),
             mode: 'markers',
-            type: 'scattergl', 
-            marker: { 
-                size: markerSizes, 
-                color: markerColors,
-                // opacity: markerOpacities, // Apply opacity array if needed
-                line: { // Add subtle border to highlighted points
-                     width: markerSizes.map(s => s === HIGHLIGHT_SIZE ? 1 : 0),
-                     color: 'rgba(0, 0, 0, 0.7)'
-                }
+            type: 'scattergl',
+            marker: {
+                size: markerSizeArray,
+                line: {
+                    width: markerBorderWidthArray,
+                    color: markerBorderColorArray,
+                },
+                ...traceMarkerConfig, // Spread color/colorscale config
+                color: pointColors, // Ensure this is always assigned
             },
-            // Add score to hover text if available
-            text: vectorIds.map(id => {
-                const result = searchResults?.find(r => r.id === id);
-                return result ? `${id}<br>Score: ${result.score.toFixed(4)}` : id;
-            }), 
-            hoverinfo: 'text', 
-            name: indexName, 
+            text: rawVectorsData.map(p => {
+                let hoverText = `ID: ${p.id}`;
+                const searchRes = searchResults?.find(r => r.id === p.id);
+                if (searchRes) {
+                    hoverText += `<br>Score: ${searchRes.score.toFixed(4)}`;
+                }
+                if (colorByField && p.metadata?.[colorByField] !== undefined) {
+                    hoverText += `<br>${colorByField}: ${p.metadata[colorByField]}`;
+                }
+                return hoverText;
+            }),
+            hoverinfo: 'text',
+            name: indexName,
+            customdata: vectorIds,
         };
-        return [trace]; 
-    }, [reducedCoords, rawVectorsData, indexName, searchResults]); // Depend on searchResults
+        return [trace];
+    }, [reducedCoords, rawVectorsData, indexName, searchResults, selectedPlotPointId, colorByField]);
 
     const layout = useMemo(() => ({
-        // Removed title from layout, handled in VisualizationWorkspace
         hovermode: 'closest',
-        xaxis: { title: 'UMAP Dimension 1', zeroline: false, showgrid: false }, // Hide grid lines
-        yaxis: { title: 'UMAP Dimension 2', zeroline: false, showgrid: false }, // Hide grid lines
-        margin: { l: 40, r: 20, b: 40, t: 20, pad: 4 }, // Tighter margins
-        showlegend: false, // Hide legend for single trace
-        // Ensure plot background is transparent to inherit Paper background
-        paper_bgcolor: 'rgba(0,0,0,0)', 
-        plot_bgcolor: 'rgba(0,0,0,0)', 
-    }), []); // No dependency needed if title is removed
+        showlegend: false, // Default to false, colorbar for numeric is part of marker
+        xaxis: { title: 'UMAP Dimension 1', zeroline: false, showgrid: false },
+        yaxis: { title: 'UMAP Dimension 2', zeroline: false, showgrid: false },
+        margin: { l: 40, r: 20, b: 40, t: 20, pad: 4 },
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(0,0,0,0)',
+        // legend: { traceorder: 'normal' } // May need if doing categorical legend manually
+    }), []);
 
     // Render conditions are now handled by VisualizationWorkspace
     // This component should only render the plot when data is ready.
@@ -96,15 +170,26 @@ function Plotter({ indexName }) {
         <Plot
             data={plotData}
             layout={layout}
-            // Let parent container (Paper in VizWorkspace) control size
-                style={{ width: '100%', height: '100%' }}
-                config={{ 
-                    responsive: true, // Make plot responsive to container size changes
-                    displaylogo: false, // Hide Plotly logo
-                    // modeBarButtonsToRemove: ['select2d', 'lasso2d'] // Example: remove some buttons
-                }}
-            />
-    ); // Removed extra closing div
+            style={{ width: '100%', height: '100%' }}
+            config={{
+                responsive: true,
+                displaylogo: false,
+            }}
+            onClick={(eventData) => {
+                if (eventData.points.length > 0) {
+                    const clickedPoint = eventData.points[0];
+                    // Retrieve the actual ID from customdata
+                    const clickedPointActualId = clickedPoint.customdata; 
+                    
+                    if (clickedPointActualId) {
+                        // If the clicked point is already selected, deselect it. Otherwise, select it.
+                        const newSelectedId = selectedPlotPointId === clickedPointActualId ? null : clickedPointActualId;
+                        dispatch(setSelectedPlotPointId({ indexName, pointId: newSelectedId }));
+                    }
+                }
+            }}
+        />
+    );
 }
 
 export default Plotter;

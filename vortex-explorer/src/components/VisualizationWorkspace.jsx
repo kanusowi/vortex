@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
-import { Box, Typography, Paper, CircularProgress, Alert } from '@mui/material'; // Import MUI components
+import { Box, Typography, Paper, CircularProgress, Alert, LinearProgress } from '@mui/material'; // Import MUI components
 import { selectSelectedIndices } from '../features/indices/indicesSlice';
 import { 
     fetchVectors, 
@@ -14,8 +14,10 @@ import {
 } from '../features/vectors/vectorsSlice';
 import DimensionalityReducer from './DimensionalityReducer';
 import Plotter from './Plotter';
-import { List, ListItem, ListItemText, Collapse, IconButton, Tooltip } from '@mui/material'; // Added for search results
-import ExpandMoreIcon from '@mui/icons-material/ExpandMore'; // Added
+import PointDetailsPanel from './PointDetailsPanel'; 
+import PlotControls from './PlotControls'; // Import PlotControls
+import { List, ListItem, Collapse, IconButton, Tooltip } from '@mui/material'; 
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'; 
 import ExpandLessIcon from '@mui/icons-material/ExpandLess'; // Added
 import { styled } from '@mui/material/styles'; // Added for styling expand icon
 
@@ -109,9 +111,12 @@ function VisualizationWorkspace() {
             </Typography>
             
             {/* Status Message Area */}
-            <Box sx={{ mb: 2, minHeight: '40px' }}> {/* Consistent height for status */}
+            <Box sx={{ mb: 2, minHeight: '40px' }}> 
                 {statusContent}
             </Box>
+
+            {/* Plot Controls - only show if an index is selected and data might be available */}
+            {selectedIndex && vectorStatus !== 'loading' && <PlotControls />}
             
             {/* Dimensionality Reducer (runs in background, no UI) */}
             <DimensionalityReducer indexName={selectedIndex} />
@@ -151,8 +156,8 @@ function VisualizationWorkspace() {
                     <List dense sx={{ maxHeight: 300, overflow: 'auto' }}>
                         {searchResults.map((item) => (
                             <React.Fragment key={item.id}>
-                                <ListItem 
-                                    disablePadding 
+                                <ListItem
+                                    disablePadding
                                     secondaryAction={
                                         item.metadata && (
                                             <Tooltip title={expandedResult === item.id ? "Collapse metadata" : "Expand metadata"}>
@@ -162,11 +167,45 @@ function VisualizationWorkspace() {
                                             </Tooltip>
                                         )
                                     }
+                                    sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', pt: 1, pb: 1 }}
                                 >
-                                    <ListItemText 
-                                        primary={`ID: ${item.id}`} 
-                                        secondary={`Score: ${item.score.toFixed(4)}`} 
-                                    />
+                                    {/* Display ID */}
+                                    <Typography variant="subtitle1" component="div" sx={{ fontWeight: 'medium' }}>
+                                        ID: {item.id}
+                                    </Typography>
+                                    {/* Box for Score text and LinearProgress bar */}
+                                    <Box sx={{ width: 'calc(100% - 40px)', display: 'flex', alignItems: 'center', mb: item.metadata && Object.keys(item.metadata).length > 0 ? 0.5 : 0, pr: '40px' }}>
+                                        <Typography variant="body2" color="text.secondary" sx={{ minWidth: '90px' }}>
+                                            Score: {item.score.toFixed(4)}
+                                        </Typography>
+                                        <LinearProgress
+                                            variant="determinate"
+                                            value={Math.max(0, Math.min(100, item.score * 100))} // Assuming score is 0-1 similarity
+                                            sx={{ flexGrow: 1, height: 8, borderRadius: 4, ml: 1 }}
+                                            color={item.score > 0.75 ? "success" : item.score > 0.5 ? "warning" : "error"} // Color based on score
+                                        />
+                                    </Box>
+                                    {/* Display first few metadata entries */}
+                                    {item.metadata && Object.entries(item.metadata).slice(0, 2).map(([key, value]) => (
+                                        <Typography
+                                            component="div"
+                                            variant="caption"
+                                            display="block"
+                                            key={key}
+                                            sx={{
+                                                color: 'text.secondary',
+                                                pl: 0,
+                                                fontSize: '0.75rem',
+                                                mt: 0.5,
+                                                whiteSpace: 'nowrap',
+                                                overflow: 'hidden',
+                                                textOverflow: 'ellipsis',
+                                                maxWidth: 'calc(100% - 40px)'
+                                            }}
+                                        >
+                                            {`${key}: ${String(value)}`}
+                                        </Typography>
+                                    ))}
                                 </ListItem>
                                 {item.metadata && (
                                     <Collapse in={expandedResult === item.id} timeout="auto" unmountOnExit>
@@ -188,6 +227,9 @@ function VisualizationWorkspace() {
                     <Typography variant="body2" color="text.secondary">Searching...</Typography>
                 </Box>
             )}
+
+            {/* Point Details Panel */}
+            <PointDetailsPanel />
         </Box>
     );
 }

@@ -33,7 +33,9 @@ const initialState = {
   //   umapError: string | null,
   //   searchResults: Array<{id: string, score: number, metadata?: object}> | null,
   //   searchStatus: 'idle'|'searching'|'succeeded'|'failed',
-  //   searchError: string | null
+  //   searchError: string | null,
+  //   selectedPlotPointId: string | null,
+  //   colorByMetadataField: string | null
   // } 
 };
 
@@ -155,6 +157,22 @@ const vectorsSlice = createSlice({
         if (state.dataByIndex[indexName]) {
             delete state.dataByIndex[indexName];
         }
+    },
+    setSelectedPlotPointId: (state, action) => {
+      const { indexName, pointId } = action.payload;
+      if (state.dataByIndex[indexName]) {
+        state.dataByIndex[indexName].selectedPlotPointId = pointId;
+      } else {
+        console.warn(`Cannot set selected plot point ID for non-existent index data: ${indexName}`);
+      }
+    },
+    setColorByMetadataField: (state, action) => {
+      const { indexName, fieldName } = action.payload;
+      if (state.dataByIndex[indexName]) {
+        state.dataByIndex[indexName].colorByMetadataField = fieldName;
+      } else {
+        console.warn(`Cannot set color-by-metadata-field for non-existent index data: ${indexName}`);
+      }
     }
   },
   extraReducers: (builder) => {
@@ -172,7 +190,9 @@ const vectorsSlice = createSlice({
             umapError: null,
             searchResults: null,
             searchStatus: 'idle',
-            searchError: null
+            searchError: null,
+            selectedPlotPointId: null, // Initialize here
+            colorByMetadataField: null // Initialize here
         };
       })
       .addCase(fetchVectors.fulfilled, (state, action) => {
@@ -261,7 +281,9 @@ export const {
     clearVectorData,
     resetAddVectorStatus,
     resetSyntheticDataStatus,
-    resetBatchAddStatus // Added for batch add
+    resetBatchAddStatus, // Added for batch add
+    setSelectedPlotPointId,
+    setColorByMetadataField
 } = vectorsSlice.actions;
 
 // Export selectors
@@ -281,6 +303,8 @@ export const selectSyntheticDataError = (state) => state.vectors.syntheticDataEr
 // Batch Add Selectors
 export const selectGlobalBatchAddStatus = (state) => state.vectors.globalBatchAddStatus;
 export const selectGlobalBatchAddError = (state) => state.vectors.globalBatchAddError;
+export const selectSelectedPlotPointId = (indexName) => (state) => state.vectors.dataByIndex[indexName]?.selectedPlotPointId || null;
+export const selectColorByMetadataField = (indexName) => (state) => state.vectors.dataByIndex[indexName]?.colorByMetadataField || null;
 
 
 // Selector to get all data for an index (useful for components)

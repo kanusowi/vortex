@@ -64,6 +64,7 @@ function CreateIndexModal() {
         const seedVal = data.seed && data.seed.trim() !== '' ? parseInt(data.seed, 10) : null;
         
         const hnswConfigPayload = {
+            vector_dim: parseInt(data.dimensions, 10), // Add vector_dim here
             m: mVal,
             m_max0: mMax0Val,
             ef_construction: efConstructionVal,
@@ -79,7 +80,7 @@ function CreateIndexModal() {
 
         const payload = {
             indexName: data.indexName,
-            dimensions: parseInt(data.dimensions, 10),
+            dimensions: parseInt(data.dimensions, 10), // Add back top-level dimensions
             metric: backendMetric,
             config: hnswConfigPayload, 
         };

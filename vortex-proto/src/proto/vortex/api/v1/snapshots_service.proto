@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package vortex.api.v1;
+
+import "google/protobuf/timestamp.proto";
+import "vortex/api/v1/common.proto"; // Assuming common types like OperationStatus might be here or defined locally
+
+option go_package = "github.com/kanusowi/vortex/proto/vortex/api/v1;vortex_api_v1";
+option java_package = "dev.vortex.proto.api.v1";
+option java_multiple_files = true;
+option java_outer_classname = "SnapshotsServiceProto";
+option csharp_namespace = "Vortex.Api.V1";
+option php_namespace = "Vortex\\Api\\V1";
+
+// Service to manage collection snapshots
+service SnapshotsService {
+  // Creates a snapshot for a given collection.
+  rpc CreateCollectionSnapshot(CreateCollectionSnapshotRequest) returns (CreateCollectionSnapshotResponse);
+
+  // Restores a collection from a given snapshot.
+  rpc RestoreCollectionSnapshot(RestoreCollectionSnapshotRequest) returns (RestoreCollectionSnapshotResponse);
+
+  // Lists all available snapshots for a given collection.
+  rpc ListCollectionSnapshots(ListCollectionSnapshotsRequest) returns (ListCollectionSnapshotsResponse);
+
+  // Deletes a specific snapshot for a given collection.
+  rpc DeleteCollectionSnapshot(DeleteCollectionSnapshotRequest) returns (DeleteCollectionSnapshotResponse);
+}
+
+// Describes a snapshot.
+message SnapshotDescription {
+  string snapshot_name = 1;
+  string collection_name = 2;
+  google.protobuf.Timestamp creation_time = 3;
+  int64 size_bytes = 4;
+  string vortex_version = 5;
+  // Additional manifest details can be added here if needed for listings,
+  // e.g., checkpoint LSN, but keeping it concise for now.
+}
+
+// Request to create a collection snapshot.
+message CreateCollectionSnapshotRequest {
+  string collection_name = 1;
+  // If not provided, a name will be auto-generated (e.g., based on timestamp).
+  optional string snapshot_name = 2;
+  // If true, the server will attempt to flush all pending writes for the collection before snapshotting.
+  // Defaults to true if not specified.
+  optional bool wait_flush = 3;
+}
+
+// Response for creating a collection snapshot.
+message CreateCollectionSnapshotResponse {
+  SnapshotDescription snapshot_description = 1;
+  OperationStatus status = 2;
+}
+
+// Request to restore a collection from a snapshot.
+message RestoreCollectionSnapshotRequest {
+  // The name the collection should have after restoration.
+  string target_collection_name = 1;
+  // The name of the snapshot to restore from.
+  string snapshot_name = 2;
+  // The original name of the collection when the snapshot was taken (used to locate the snapshot).
+  string source_collection_name = 3;
+}
+
+// Response for restoring a collection from a snapshot.
+message RestoreCollectionSnapshotResponse {
+  OperationStatus status = 1;
+}
+
+// Request to list snapshots for a collection.
+message ListCollectionSnapshotsRequest {
+  string collection_name = 1;
+}
+
+// Response for listing snapshots.
+message ListCollectionSnapshotsResponse {
+  repeated SnapshotDescription snapshots = 1;
+}
+
+// Request to delete a collection snapshot.
+message DeleteCollectionSnapshotRequest {
+  string collection_name = 1;
+  string snapshot_name = 2;
+}
+
+// Response for deleting a collection snapshot.
+message DeleteCollectionSnapshotResponse {
+  OperationStatus status = 1;
+}
