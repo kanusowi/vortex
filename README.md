@@ -16,8 +16,7 @@ Vortex is a comprehensive system for efficient vector similarity search and inte
 
 Vortex is well-suited for applications such as Retrieval-Augmented Generation (RAG), semantic search, recommendation systems, and general-purpose vector data analysis and exploration.
 
-<details>
-<summary><b>Key Features</b></summary>
+## Key Features
 
 ### Core Library
 - Pure Rust HNSW implementation with multiple distance metrics
@@ -33,7 +32,6 @@ Vortex is well-suited for applications such as Retrieval-Augmented Generation (R
 - Interactive UI with React and Material UI
 - Comprehensive index and vector management
 - 2D visualization with UMAP and interactive exploration
-</details>
 
 ## Architecture
 
